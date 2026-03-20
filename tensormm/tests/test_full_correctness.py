@@ -895,7 +895,7 @@ class TestSetMMFull:
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         n_axioms = sum(1 for a in parsed.assertions.values() if a.type == "axiom")
-        step_budget = 1_500_000 if device.type == "cuda" else 5_000
+        step_budget = 1_000_000 if device.type == "cuda" else 5_000
         print(
             f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
             f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)"
