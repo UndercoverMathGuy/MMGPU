@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import itertools
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from tensormm.parser import ParsedDatabase
@@ -11,6 +13,7 @@ from tensormm.parser import ParsedDatabase
 @dataclass
 class VerificationResult:
     """Result of verifying a single theorem's proof."""
+
     success: bool
     label: str
     error_message: str | None = None
@@ -33,6 +36,19 @@ def apply_substitution(expression: Stmt, substitution: dict[str, Stmt]) -> Stmt:
         else:
             result.append(tok)
     return result
+
+
+def _verify_chunk(
+    parsed: ParsedDatabase,
+    labels: list[str],
+) -> dict[str, "VerificationResult"]:
+    """Worker function for ProcessPoolExecutor.
+
+    Creates a CPUVerifier in the worker process and verifies the given labels.
+    Must be a top-level function to be picklable.
+    """
+    verifier = CPUVerifier(parsed)
+    return {lbl: verifier.verify_proof(lbl) for lbl in labels}
 
 
 class CPUVerifier:
@@ -121,7 +137,7 @@ class CPUVerifier:
                         )
 
             # Pop consumed entries and push the substituted conclusion
-            del stack[len(stack) - npop:]
+            del stack[len(stack) - npop :]
             stack.append(apply_substitution(assertion.expression, subst))
 
     def _treat_saved_stmt(self, stmt: Stmt, stack: list[Stmt]) -> None:
@@ -132,15 +148,17 @@ class CPUVerifier:
         """Verify the proof of a single theorem."""
         if label not in self.db.assertions:
             return VerificationResult(
-                success=False, label=label,
-                error_message=f"Label '{label}' not found in assertions"
+                success=False,
+                label=label,
+                error_message=f"Label '{label}' not found in assertions",
             )
 
         assertion = self.db.assertions[label]
         if assertion.type != "theorem":
             return VerificationResult(
-                success=False, label=label,
-                error_message=f"Label '{label}' is an axiom, not a theorem"
+                success=False,
+                label=label,
+                error_message=f"Label '{label}' is an axiom, not a theorem",
             )
 
         stack: list[Stmt] = []
@@ -182,21 +200,22 @@ class CPUVerifier:
                     steps += 1
             else:
                 return VerificationResult(
-                    success=False, label=label,
-                    error_message="Theorem has no proof"
+                    success=False, label=label, error_message="Theorem has no proof"
                 )
 
             # Final check: stack must have exactly one entry matching conclusion
             if len(stack) != 1:
                 return VerificationResult(
-                    success=False, label=label,
+                    success=False,
+                    label=label,
                     error_message=f"Stack has {len(stack)} entries at end of proof, expected 1",
                     steps_verified=steps,
                 )
 
             if stack[0] != assertion.expression:
                 return VerificationResult(
-                    success=False, label=label,
+                    success=False,
+                    label=label,
                     error_message=(
                         f"Final stack entry {stack[0]} does not match "
                         f"conclusion {assertion.expression}"
@@ -208,14 +227,50 @@ class CPUVerifier:
 
         except ValueError as e:
             return VerificationResult(
-                success=False, label=label,
-                error_message=str(e), steps_verified=steps,
+                success=False,
+                label=label,
+                error_message=str(e),
+                steps_verified=steps,
             )
 
-    def verify_all(self) -> dict[str, VerificationResult]:
-        """Verify all theorems in the database."""
+    def verify_all(
+        self, max_workers: int | None = None
+    ) -> dict[str, VerificationResult]:
+        """Verify all theorems in the database using a ProcessPoolExecutor.
+
+        Each theorem's proof is verified independently in a worker process,
+        bypassing the GIL for true CPU parallelism.
+
+        Args:
+            max_workers: Number of worker processes. Defaults to os.cpu_count().
+        """
+        theorem_labels = [
+            label
+            for label, assertion in self.db.assertions.items()
+            if assertion.type == "theorem"
+        ]
+
+        if not theorem_labels:
+            return {}
+
+        workers = max_workers or os.cpu_count() or 1
         results: dict[str, VerificationResult] = {}
-        for label, assertion in self.db.assertions.items():
-            if assertion.type == "theorem":
-                results[label] = self.verify_proof(label)
+
+        # Each worker process gets the full ParsedDatabase (picklable dataclass)
+        # and verifies a chunk of theorems independently.
+        chunk_size = max(1, (len(theorem_labels) + workers - 1) // workers)
+        chunks = [
+            theorem_labels[i : i + chunk_size]
+            for i in range(0, len(theorem_labels), chunk_size)
+        ]
+
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_verify_chunk, self.db, chunk): chunk
+                for chunk in chunks
+            }
+            for future in as_completed(futures):
+                chunk_results = future.result()
+                results.update(chunk_results)
+
         return results

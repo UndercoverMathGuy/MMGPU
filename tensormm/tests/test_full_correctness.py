@@ -23,6 +23,7 @@ import gc
 import os
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import torch
@@ -55,7 +56,9 @@ def _get_gpu_device() -> torch.device:
         return torch.device("cuda")
     if MPS_AVAILABLE:
         return torch.device("mps")
-    pytest.skip("No GPU available (need CUDA or MPS) — cannot run GPU correctness checks")
+    pytest.skip(
+        "No GPU available (need CUDA or MPS) — cannot run GPU correctness checks"
+    )
     raise RuntimeError("unreachable")  # for type checker
 
 
@@ -69,15 +72,17 @@ def _gpu_backend_name() -> str:
 
 # ── Replay a proof on CPU, extracting every assertion-step's substitution ──
 
+
 @dataclass
 class _AssertionStep:
     """One assertion-step extracted from a proof replay."""
-    theorem_label: str     # which theorem this step belongs to
-    step_index: int        # step index within that theorem's proof
-    step_label: str        # label of the axiom/theorem applied
-    pattern: list[str]     # conclusion expression of the applied assertion
+
+    theorem_label: str  # which theorem this step belongs to
+    step_index: int  # step index within that theorem's proof
+    step_label: str  # label of the axiom/theorem applied
+    pattern: list[str]  # conclusion expression of the applied assertion
     substitution: dict[str, list[str]]  # variable -> replacement tokens
-    expected_result: list[str]          # apply_substitution(pattern, subst)
+    expected_result: list[str]  # apply_substitution(pattern, subst)
 
 
 def _build_label_info(parsed: ParsedDatabase) -> dict[str, tuple[str, object]]:
@@ -132,16 +137,18 @@ def _replay_proof_extract_steps(
         for elbl in e_labels:
             sp += 1
         result = apply_substitution(a.expression, subst)
-        steps.append(_AssertionStep(
-            theorem_label=theorem_label,
-            step_index=step_counter,
-            step_label=step_label,
-            pattern=a.expression,
-            substitution=subst,
-            expected_result=result,
-        ))
+        steps.append(
+            _AssertionStep(
+                theorem_label=theorem_label,
+                step_index=step_counter,
+                step_label=step_label,
+                pattern=a.expression,
+                substitution=subst,
+                expected_result=result,
+            )
+        )
         step_counter += 1
-        del stack[len(stack) - npop:]
+        del stack[len(stack) - npop :]
         stack.append(result)
         return None
 
@@ -181,20 +188,67 @@ def _replay_proof_extract_steps(
     return steps
 
 
+def _replay_chunk(
+    parsed: ParsedDatabase,
+    chunk: list[str],
+) -> tuple[list[_AssertionStep], list[str]]:
+    """Worker function for ProcessPoolExecutor.
+
+    Builds the label_info once per worker process and replays a chunk of theorems.
+    Must be a top-level-importable function to be picklable.
+    """
+    label_info = _build_label_info(parsed)
+    steps: list[_AssertionStep] = []
+    errors: list[str] = []
+    for lbl in chunk:
+        extracted = _replay_proof_extract_steps(parsed, lbl, label_info)
+        if isinstance(extracted, str):
+            errors.append(f"  REPLAY ERR  {lbl}: {extracted}")
+        else:
+            steps.extend(extracted)
+    return steps, errors
+
+
 def _collect_all_steps(
     parsed: ParsedDatabase,
     theorem_labels: list[str],
+    max_workers: int | None = None,
 ) -> tuple[list[_AssertionStep], list[str]]:
-    """Replay all theorems, return (all_steps, replay_errors)."""
-    label_info = _build_label_info(parsed)
+    """Replay all theorems in parallel, return (all_steps, replay_errors).
+
+    Uses ProcessPoolExecutor to distribute proof replay across CPU cores,
+    bypassing the GIL. Each worker process gets the full ParsedDatabase
+    (a picklable dataclass) and replays an independent chunk of theorems.
+    Results are re-assembled in original label order.
+    """
+    if not theorem_labels:
+        return [], []
+
+    workers = max_workers or os.cpu_count() or 1
+    chunk_size = max(1, (len(theorem_labels) + workers - 1) // workers)
+    chunks = [
+        theorem_labels[i : i + chunk_size]
+        for i in range(0, len(theorem_labels), chunk_size)
+    ]
+
+    # Map future → chunk index to preserve order
+    ordered_results: list[tuple[list[_AssertionStep], list[str]]] = [None] * len(chunks)  # type: ignore[list-item]
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_to_idx = {
+            executor.submit(_replay_chunk, parsed, chunk): idx
+            for idx, chunk in enumerate(chunks)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            ordered_results[idx] = future.result()
+
     all_steps: list[_AssertionStep] = []
     replay_errors: list[str] = []
-    for lbl in theorem_labels:
-        extracted = _replay_proof_extract_steps(parsed, lbl, label_info)
-        if isinstance(extracted, str):
-            replay_errors.append(f"  REPLAY ERR  {lbl}: {extracted}")
-        else:
-            all_steps.extend(extracted)
+    for steps, errors in ordered_results:
+        all_steps.extend(steps)
+        replay_errors.extend(errors)
+
     return all_steps, replay_errors
 
 
@@ -215,9 +269,14 @@ def _verify_steps_batched_on_gpu(
     """
     N = len(all_steps)
     if N == 0:
-        return [], {"total_steps": 0, "num_groups": 0, "max_batch": 0, "steps_verified": 0}
+        return [], {
+            "total_steps": 0,
+            "num_groups": 0,
+            "max_batch": 0,
+            "steps_verified": 0,
+        }
 
-    use_metal = (device.type == "mps" and METAL_AVAILABLE)
+    use_metal = device.type == "mps" and METAL_AVAILABLE
     if use_metal:
         verifier = MetalVerifier()
     else:
@@ -283,8 +342,11 @@ def _verify_steps_batched_on_gpu(
     V = len(sorted_ids)
 
     stats: dict[str, int] = {
-        "total_steps": N, "num_groups": len(unique_groups),
-        "max_batch": N, "steps_verified": 0, "compact_vocab": V,
+        "total_steps": N,
+        "num_groups": len(unique_groups),
+        "max_batch": N,
+        "steps_verified": 0,
+        "compact_vocab": V,
     }
 
     # ── Phase 2: PURE NUMPY — sort, remap, pack ──────────────────────
@@ -306,7 +368,9 @@ def _verify_steps_batched_on_gpu(
     # Remap ALL tokens to compact vocab in one vectorized call
     all_pat_toks_c = f2c_lut[all_pat_toks_np]
     all_tgt_toks_c = f2c_lut[all_tgt_toks_np]
-    all_sub_toks_c = f2c_lut[all_sub_toks_np] if len(all_sub_toks_np) else all_sub_toks_np
+    all_sub_toks_c = (
+        f2c_lut[all_sub_toks_np] if len(all_sub_toks_np) else all_sub_toks_np
+    )
     all_sub_var_c = f2c_lut[all_sub_var_np] if len(all_sub_var_np) else all_sub_var_np
 
     # Sort order: (P_len, S_max)
@@ -329,7 +393,9 @@ def _verify_steps_batched_on_gpu(
     total_pat_toks = int(pat_lens_i64.sum())
     step_idx_p = np.repeat(np.arange(N, dtype=np.int32), pat_lengths_s)
     pat_cumstart = np.repeat(np.cumsum(pat_lens_i64) - pat_lens_i64, pat_lengths_s)
-    pos_within = (np.arange(total_pat_toks, dtype=np.int64) - pat_cumstart).astype(np.int32)
+    pos_within = (np.arange(total_pat_toks, dtype=np.int64) - pat_cumstart).astype(
+        np.int32
+    )
     src_idx_p = np.repeat(pat_offsets_s, pat_lengths_s) + pos_within
 
     patterns_np = np.zeros((N, P_max), dtype=np.int32)
@@ -340,7 +406,9 @@ def _verify_steps_batched_on_gpu(
     total_tgt_toks = int(tgt_lens_i64.sum())
     step_idx_t = np.repeat(np.arange(N, dtype=np.int32), tgt_lengths_s)
     tgt_cumstart = np.repeat(np.cumsum(tgt_lens_i64) - tgt_lens_i64, tgt_lengths_s)
-    pos_within_t = (np.arange(total_tgt_toks, dtype=np.int64) - tgt_cumstart).astype(np.int32)
+    pos_within_t = (np.arange(total_tgt_toks, dtype=np.int64) - tgt_cumstart).astype(
+        np.int32
+    )
     src_idx_t = np.repeat(tgt_offsets_s, tgt_lengths_s) + pos_within_t
 
     targets_np = np.zeros((N, T_max), dtype=np.int32)
@@ -403,7 +471,9 @@ def _verify_steps_batched_on_gpu(
                 sc_step = np.repeat(c_step, rc)
                 sc_var = np.repeat(c_var, rc)
                 offsets_within = np.repeat(np.cumsum(rc) - rc, rc)
-                sc_s = (np.arange(total_toks, dtype=np.int64) - offsets_within).astype(np.int32)
+                sc_s = (np.arange(total_toks, dtype=np.int64) - offsets_within).astype(
+                    np.int32
+                )
                 sc_tok_idx = np.repeat(c_off, rc) + sc_s.astype(np.int64)
                 sc_tok = sp_toks_np[sc_tok_idx]
                 st[sc_step, sc_var, sc_s] = sc_tok
@@ -422,8 +492,12 @@ def _verify_steps_batched_on_gpu(
         else:
             # TensorVerifier: move tensors to device, dispatch via torch ops
             gpu_out = verifier.verify_flat(
-                pat_t.to(device), pl_t.to(device), st_t.to(device),
-                sl_t.to(device), tgt_t.to(device), tl_t.to(device),
+                pat_t.to(device),
+                pl_t.to(device),
+                st_t.to(device),
+                sl_t.to(device),
+                tgt_t.to(device),
+                tl_t.to(device),
             )
         gpu_results_sorted[start:end] = gpu_out.numpy()
         stats["steps_verified"] += B
@@ -451,8 +525,8 @@ def _verify_steps_batched_on_gpu(
 #  ql.mm — EXHAUSTIVE (every theorem)
 # ══════════════════════════════════════════════════════════════════════
 
-class TestQLmmExhaustive:
 
+class TestQLmmExhaustive:
     @pytest.fixture(scope="class")
     def ql_data(self):
         path = os.path.join(DATA_DIR, "ql.mm")
@@ -477,7 +551,9 @@ class TestQLmmExhaustive:
                 failed += 1
                 print(f"  CPU FAIL  {label}: {r.error_message}")
 
-        print(f"\n[ql.mm CPU] {passed} passed, {failed} failed out of {len(results)} theorems")
+        print(
+            f"\n[ql.mm CPU] {passed} passed, {failed} failed out of {len(results)} theorems"
+        )
         assert failed == 0, f"{failed} theorems failed CPU verification"
 
     def test_gpu_matches_cpu_all_ql(self, ql_data, capsys) -> None:
@@ -490,15 +566,21 @@ class TestQLmmExhaustive:
         parsed, tok, db = ql_data
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
-        print(f"\n[ql.mm {backend}] Replaying {len(theorems)} theorems to extract assertion steps...")
+        print(
+            f"\n[ql.mm {backend}] Replaying {len(theorems)} theorems to extract assertion steps..."
+        )
 
         t0 = time.perf_counter()
         all_steps, replay_errors = _collect_all_steps(parsed, theorems)
         t_replay = time.perf_counter() - t0
-        print(f"[ql.mm {backend}] Extracted {len(all_steps)} assertion steps in {t_replay:.2f}s")
+        print(
+            f"[ql.mm {backend}] Extracted {len(all_steps)} assertion steps in {t_replay:.2f}s"
+        )
 
         t1 = time.perf_counter()
-        gpu_failures, stats = _verify_steps_batched_on_gpu(all_steps, tok, db.is_variable, device)
+        gpu_failures, stats = _verify_steps_batched_on_gpu(
+            all_steps, tok, db.is_variable, device
+        )
         t_gpu = time.perf_counter() - t1
 
         for err in replay_errors:
@@ -515,12 +597,30 @@ class TestQLmmExhaustive:
         print(f"  GPU failures:    {len(gpu_failures)}")
 
         assert len(replay_errors) == 0, f"{len(replay_errors)} proof replay errors"
-        assert len(gpu_failures) == 0, f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        assert len(gpu_failures) == 0, (
+            f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  Streaming GPU verification for large databases
 # ══════════════════════════════════════════════════════════════════════
+
+
+def _replay_batch(
+    parsed: ParsedDatabase,
+    labels: list[str],
+) -> list[tuple[str, list[_AssertionStep] | str]]:
+    """Worker: replay a batch of theorems and return [(label, steps_or_error)].
+
+    Builds label_info ONCE per worker invocation (amortised cost).
+    Top-level function required for ProcessPoolExecutor pickling.
+    """
+    label_info = _build_label_info(parsed)
+    return [
+        (lbl, _replay_proof_extract_steps(parsed, lbl, label_info)) for lbl in labels
+    ]
+
 
 def _verify_streaming(
     parsed: ParsedDatabase,
@@ -531,16 +631,18 @@ def _verify_streaming(
     step_budget: int = 30_000,
     tag: str = "GPU",
     verbose: bool = False,
+    max_workers: int | None = None,
 ) -> tuple[list[str], list[str], int, float, float, list[dict]]:
-    """Replay theorems and verify on GPU in streaming mega-batches.
+    """Replay theorems in parallel and verify on GPU in streaming mega-batches.
 
-    Accumulates steps from replay until step_budget is reached, then
-    verifies that batch on GPU and resets. Keeps peak memory bounded
-    regardless of total step count.
+    Uses ProcessPoolExecutor to run proof replay across CPU cores, bypassing
+    the GIL. Each worker replays one theorem and returns its steps. The main
+    process collects results in order, accumulates into pending until
+    step_budget is reached, then flushes to GPU.
 
     Returns (gpu_failures, replay_errors, total_steps, t_replay, t_gpu, batch_stats).
     """
-    label_info = _build_label_info(parsed)
+    workers = max_workers or os.cpu_count() or 1
     gpu_failures: list[str] = []
     replay_errors: list[str] = []
     total_steps = 0
@@ -557,52 +659,104 @@ def _verify_streaming(
             return
         t0 = time.perf_counter()
         fails, stats = _verify_steps_batched_on_gpu(
-            pending, tokenizer, is_variable, device,
+            pending,
+            tokenizer,
+            is_variable,
+            device,
         )
         dt = time.perf_counter() - t0
         t_gpu += dt
         gpu_failures.extend(fails)
-        batch_stats.append({
-            "batch": len(batch_stats) + 1,
-            "steps": len(pending),
-            "gpu_time": dt,
-            "steps_per_sec": len(pending) / dt if dt > 0 else 0,
-            "vocab": stats.get("compact_vocab", 0),
-            "failures": len(fails),
-        })
+        batch_stats.append(
+            {
+                "batch": len(batch_stats) + 1,
+                "steps": len(pending),
+                "gpu_time": dt,
+                "steps_per_sec": len(pending) / dt if dt > 0 else 0,
+                "vocab": stats.get("compact_vocab", 0),
+                "failures": len(fails),
+            }
+        )
         if verbose:
             bs = batch_stats[-1]
-            print(f"  [{tag}] Batch {bs['batch']:3d}: "
-                  f"{bs['steps']:6d} steps in {bs['gpu_time']:.2f}s "
-                  f"({bs['steps_per_sec']:,.0f} steps/s) "
-                  f"V={bs['vocab']} failures={bs['failures']}")
+            print(
+                f"  [{tag}] Batch {bs['batch']:3d}: "
+                f"{bs['steps']:6d} steps in {bs['gpu_time']:.2f}s "
+                f"({bs['steps_per_sec']:,.0f} steps/s) "
+                f"V={bs['vocab']} failures={bs['failures']}"
+            )
         pending.clear()
         gc.collect()
 
-    for lbl in theorems:
-        t0 = time.perf_counter()
-        extracted = _replay_proof_extract_steps(parsed, lbl, label_info)
-        t_replay += time.perf_counter() - t0
-        theorems_replayed += 1
+    # Split theorems into mini-batches so each worker call amortises the cost
+    # of building label_info once per batch rather than once per theorem.
+    # Aim for ~256 theorems per worker call (tunable).
+    replay_batch_size = max(1, min(256, (len(theorems) + workers - 1) // workers))
+    replay_batches = [
+        theorems[i : i + replay_batch_size]
+        for i in range(0, len(theorems), replay_batch_size)
+    ]
 
-        if verbose and theorems_replayed % 5000 == 0:
-            print(f"  [{tag}] Replay: {theorems_replayed:,}/{len(theorems):,} theorems, "
-                  f"{total_steps + len(pending):,} steps, {t_replay:.1f}s")
+    # Use ProcessPoolExecutor to parallelise proof replay across CPU cores.
+    # We maintain a bounded window of in-flight futures so we don't materialise
+    # all steps in memory at once. Results are consumed in submission order.
+    import collections
 
-        # Free proof data after replay to reduce ParsedDatabase footprint
-        a = parsed.assertions[lbl]
-        a.proof = None
-        a.compressed_proof = None
+    future_queue: collections.deque = collections.deque()
+    max_inflight = workers * 2  # keep the pool fed without unbounded memory
 
-        if isinstance(extracted, str):
-            replay_errors.append(f"  REPLAY ERR  {lbl}: {extracted}")
-            continue
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        batch_iter = iter(enumerate(replay_batches))
+        exhausted = False
 
-        total_steps += len(extracted)
-        pending.extend(extracted)
+        def _submit_next_batch() -> bool:
+            nonlocal exhausted
+            try:
+                _, batch = next(batch_iter)
+                fut = executor.submit(_replay_batch, parsed, batch)
+                future_queue.append((batch, fut))
+                return True
+            except StopIteration:
+                exhausted = True
+                return False
 
-        if len(pending) >= step_budget:
-            _flush()
+        # Pre-fill the pipeline
+        for _ in range(min(max_inflight, len(replay_batches))):
+            _submit_next_batch()
+
+        while future_queue:
+            batch_labels, fut = future_queue.popleft()
+
+            # Keep the pipeline full while we wait for the oldest future
+            if not exhausted:
+                _submit_next_batch()
+
+            t0 = time.perf_counter()
+            batch_results = fut.result()  # list[(lbl, steps_or_err)]
+            t_replay += time.perf_counter() - t0
+            theorems_replayed += len(batch_labels)
+
+            if verbose and theorems_replayed % 5000 < len(batch_labels):
+                print(
+                    f"  [{tag}] Replay: {theorems_replayed:,}/{len(theorems):,} theorems, "
+                    f"{total_steps + len(pending):,} steps, {t_replay:.1f}s"
+                )
+
+            for lbl, extracted in batch_results:
+                # Free proof data in the main process after the worker is done
+                a = parsed.assertions[lbl]
+                a.proof = None
+                a.compressed_proof = None
+
+                if isinstance(extracted, str):
+                    replay_errors.append(f"  REPLAY ERR  {lbl}: {extracted}")
+                    continue
+
+                total_steps += len(extracted)
+                pending.extend(extracted)
+
+                if len(pending) >= step_budget:
+                    _flush()
 
     _flush()  # remaining
 
@@ -613,8 +767,8 @@ def _verify_streaming(
 #  set.mm — first 1000 theorems
 # ══════════════════════════════════════════════════════════════════════
 
-class TestSetMMFirst1000:
 
+class TestSetMMFirst1000:
     @pytest.fixture(scope="class")
     def setmm_data(self):
         path = os.path.join(DATA_DIR, "set.mm")
@@ -624,10 +778,12 @@ class TestSetMMFirst1000:
         t0 = time.perf_counter()
         parsed = parse_mm_file(path)
         elapsed = time.perf_counter() - t0
-        print(f"[set.mm] Parsed in {elapsed:.1f}s: "
-              f"{len(parsed.assertions)} assertions, "
-              f"{len(parsed.constants)} constants, "
-              f"{len(parsed.variables)} variables")
+        print(
+            f"[set.mm] Parsed in {elapsed:.1f}s: "
+            f"{len(parsed.assertions)} assertions, "
+            f"{len(parsed.constants)} constants, "
+            f"{len(parsed.variables)} variables"
+        )
         tok = Tokenizer()
         db = MetamathDatabase(parsed, tok)
         return parsed, tok, db
@@ -637,9 +793,9 @@ class TestSetMMFirst1000:
         parsed, tok, db = setmm_data
         cpu_v = CPUVerifier(parsed)
 
-        theorems = [
-            lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"
-        ][:1000]
+        theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"][
+            :1000
+        ]
 
         passed = failed = 0
         failures: list[str] = []
@@ -653,7 +809,9 @@ class TestSetMMFirst1000:
 
         for f in failures:
             print(f)
-        print(f"\n[set.mm CPU] {passed} passed, {failed} failed out of {len(theorems)} theorems")
+        print(
+            f"\n[set.mm CPU] {passed} passed, {failed} failed out of {len(theorems)} theorems"
+        )
         assert failed == 0, f"{failed} theorems failed CPU verification"
 
     def test_gpu_matches_cpu_first_1000_set_mm(self, setmm_data, capsys) -> None:
@@ -662,14 +820,21 @@ class TestSetMMFirst1000:
         backend = _gpu_backend_name()
         parsed, tok, db = setmm_data
 
-        theorems = [
-            lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"
-        ][:1000]
+        theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"][
+            :1000
+        ]
 
         print(f"\n[set.mm {backend}] Verifying {len(theorems)} theorems (streaming)...")
 
-        gpu_failures, replay_errors, total_steps, t_replay, t_gpu, _ = _verify_streaming(
-            parsed, theorems, tok, db.is_variable, device, tag="set.mm",
+        gpu_failures, replay_errors, total_steps, t_replay, t_gpu, _ = (
+            _verify_streaming(
+                parsed,
+                theorems,
+                tok,
+                db.is_variable,
+                device,
+                tag="set.mm",
+            )
         )
 
         for err in replay_errors:
@@ -685,15 +850,17 @@ class TestSetMMFirst1000:
         print(f"  GPU failures:    {len(gpu_failures)}")
 
         assert len(replay_errors) == 0, f"{len(replay_errors)} proof replay errors"
-        assert len(gpu_failures) == 0, f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        assert len(gpu_failures) == 0, (
+            f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  set.mm — FULL (all ~47k theorems, streaming)
 # ══════════════════════════════════════════════════════════════════════
 
-class TestSetMMFull:
 
+class TestSetMMFull:
     @pytest.fixture(scope="class")
     def setmm_data(self):
         path = os.path.join(DATA_DIR, "set.mm")
@@ -703,8 +870,10 @@ class TestSetMMFull:
         t0 = time.perf_counter()
         parsed = parse_mm_file(path)
         elapsed = time.perf_counter() - t0
-        print(f"[set.mm FULL] Parsed in {elapsed:.1f}s: "
-              f"{len(parsed.assertions)} assertions")
+        print(
+            f"[set.mm FULL] Parsed in {elapsed:.1f}s: "
+            f"{len(parsed.assertions)} assertions"
+        )
         # Build ONLY the tokenizer + is_variable mask — skip MetamathDatabase
         # to avoid ~600MB of padded assertion tensors we don't need
         tok = Tokenizer()
@@ -727,16 +896,28 @@ class TestSetMMFull:
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         n_axioms = sum(1 for a in parsed.assertions.values() if a.type == "axiom")
         step_budget = 1_500_000 if device.type == "cuda" else 5_000
-        print(f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
-              f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)")
-        print(f"  Streaming budget: {'ALL (single batch)' if device.type == 'cuda' else f'{step_budget // 1000}k steps/batch'}")
+        print(
+            f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
+            f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)"
+        )
+        print(
+            f"  Streaming budget: {'ALL (single batch)' if device.type == 'cuda' else f'{step_budget // 1000}k steps/batch'}"
+        )
         print(f"  Backend: {backend}")
         print()
 
         t_total_0 = time.perf_counter()
-        gpu_failures, replay_errors, total_steps, t_replay, t_gpu, batch_stats = _verify_streaming(
-            parsed, theorems, tok, is_variable, device,
-            step_budget=step_budget, tag="set.mm FULL", verbose=True,
+        gpu_failures, replay_errors, total_steps, t_replay, t_gpu, batch_stats = (
+            _verify_streaming(
+                parsed,
+                theorems,
+                tok,
+                is_variable,
+                device,
+                step_budget=step_budget,
+                tag="set.mm FULL",
+                verbose=True,
+            )
         )
         t_total = time.perf_counter() - t_total_0
 
@@ -774,10 +955,14 @@ class TestSetMMFull:
         print(f"  Errors")
         print(f"    Replay errors:      {len(replay_errors)}")
         print(f"    GPU failures:       {len(gpu_failures)}")
-        print(f"    Replay success:     {len(theorems) - len(replay_errors)}/{len(theorems)} "
-              f"({100 * (len(theorems) - len(replay_errors)) / len(theorems):.1f}%)")
+        print(
+            f"    Replay success:     {len(theorems) - len(replay_errors)}/{len(theorems)} "
+            f"({100 * (len(theorems) - len(replay_errors)) / len(theorems):.1f}%)"
+        )
         print(f"{'═' * 60}")
 
         # Allow replay errors (some set.mm proofs may use features we don't support)
         # but GPU failures are UNSOUND
-        assert len(gpu_failures) == 0, f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        assert len(gpu_failures) == 0, (
+            f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        )
