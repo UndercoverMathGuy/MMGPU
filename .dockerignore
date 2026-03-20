@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.windsurf/
+*.egg-info/
+data/set.mm
+data/ql.mm

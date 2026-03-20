@@ -1,0 +1,14 @@
+[project]
+name = "mmgpu"
+version = "0.1.0"
+description = "GPU-Accelerated Metamath Proof Verification via PyTorch Tensor Operations"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.2.6",
+    "pytest>=9.0.2",
+    "torch>=2.10.0",
+]
+
+[project.optional-dependencies]
+metal = ["pyobjc-framework-Metal>=12.0"]
