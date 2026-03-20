@@ -365,9 +365,9 @@ def _verify_steps_batched_on_gpu(
         np.cumsum(sp_len_np[:-1].astype(np.int64), out=sp_offsets_np[1:])
 
     # ── Phase 3: chunked GPU dispatch — adaptive chunk size ─────────
-    # H100: 80GB HBM3, M1: 8GB unified — scale budget accordingly
+    # H100 NVL: 94GB HBM3, M1: 8GB unified — scale budget accordingly
     if device.type == "cuda":
-        GPU_MEM_BUDGET = 4 * 1024 * 1024 * 1024  # 4 GB
+        GPU_MEM_BUDGET = 80 * 1024 * 1024 * 1024  # 80 GB — saturate the H100
     else:
         GPU_MEM_BUDGET = 512 * 1024 * 1024  # 512 MB
 
@@ -722,10 +722,10 @@ class TestSetMMFull:
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         n_axioms = sum(1 for a in parsed.assertions.values() if a.type == "axiom")
-        step_budget = 30_000 if device.type == "cuda" else 5_000
+        step_budget = 500_000 if device.type == "cuda" else 5_000
         print(f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
               f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)")
-        print(f"  Streaming budget: {step_budget // 1000}k steps/batch")
+        print(f"  Streaming budget: {'ALL (single batch)' if device.type == 'cuda' else f'{step_budget // 1000}k steps/batch'}")
         print(f"  Backend: {backend}")
         print()
 
