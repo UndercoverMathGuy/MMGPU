@@ -585,6 +585,10 @@ def _verify_streaming(
         t_replay += time.perf_counter() - t0
         theorems_replayed += 1
 
+        if verbose and theorems_replayed % 5000 == 0:
+            print(f"  [{tag}] Replay: {theorems_replayed:,}/{len(theorems):,} theorems, "
+                  f"{total_steps + len(pending):,} steps, {t_replay:.1f}s")
+
         # Free proof data after replay to reduce ParsedDatabase footprint
         a = parsed.assertions[lbl]
         a.proof = None
@@ -722,7 +726,7 @@ class TestSetMMFull:
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         n_axioms = sum(1 for a in parsed.assertions.values() if a.type == "axiom")
-        step_budget = 4_000_000 if device.type == "cuda" else 5_000
+        step_budget = 1_500_000 if device.type == "cuda" else 5_000
         print(f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
               f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)")
         print(f"  Streaming budget: {'ALL (single batch)' if device.type == 'cuda' else f'{step_budget // 1000}k steps/batch'}")
