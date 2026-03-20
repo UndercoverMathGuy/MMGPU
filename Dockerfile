@@ -33,14 +33,10 @@ RUN mkdir -p data \
     https://raw.githubusercontent.com/metamath/set.mm/develop/set.mm \
     && echo "set.mm: $(wc -c < data/set.mm) bytes"
 
-# Copy project source (after data layer for better caching)
+# Copy project source
 COPY pyproject.toml .
 COPY tensormm/ tensormm/
+COPY run_setmm.py .
 
-# Smoke test: verify torch + project imports work
-RUN python3 -c "import torch; print(f'PyTorch {torch.__version__}, CUDA compiled: {torch.version.cuda}')"
-RUN python3 -c "from tensormm.tensor_verifier import TensorVerifier; print('TensorVerifier OK')"
-
-# Default: run ONLY the full set.mm verification on GPU
-ENTRYPOINT ["python3", "-m", "pytest"]
-CMD ["tensormm/tests/test_full_correctness.py::TestSetMMFull::test_gpu_all_set_mm", "-v", "-s", "--tb=short"]
+# Default: run full set.mm GPU verification (no pytest, no silent skips)
+CMD ["python3", "run_setmm.py"]
