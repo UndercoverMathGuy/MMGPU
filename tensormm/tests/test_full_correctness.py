@@ -188,16 +188,34 @@ def _replay_proof_extract_steps(
     return steps
 
 
+# ── Worker process globals (set once by _init_worker, avoid per-call pickling) ──
+_WORKER_PARSED: ParsedDatabase | None = None
+_WORKER_LABEL_INFO: dict[str, tuple[str, object]] | None = None
+
+
+def _init_worker(parsed: ParsedDatabase) -> None:
+    """ProcessPoolExecutor initializer — runs ONCE per worker process.
+
+    Stores the ParsedDatabase and pre-built label_info as process globals.
+    This means the (large) ParsedDatabase is pickled exactly `workers` times
+    at pool creation, NOT once per submit() call.
+    """
+    global _WORKER_PARSED, _WORKER_LABEL_INFO
+    _WORKER_PARSED = parsed
+    _WORKER_LABEL_INFO = _build_label_info(parsed)
+
+
 def _replay_chunk(
-    parsed: ParsedDatabase,
     chunk: list[str],
 ) -> tuple[list[_AssertionStep], list[str]]:
     """Worker function for ProcessPoolExecutor.
 
-    Builds the label_info once per worker process and replays a chunk of theorems.
-    Must be a top-level-importable function to be picklable.
+    Uses process-global _WORKER_PARSED and _WORKER_LABEL_INFO set by _init_worker.
+    Each submit() only pickles the lightweight label list.
     """
-    label_info = _build_label_info(parsed)
+    parsed = _WORKER_PARSED
+    label_info = _WORKER_LABEL_INFO
+    assert parsed is not None and label_info is not None
     steps: list[_AssertionStep] = []
     errors: list[str] = []
     for lbl in chunk:
@@ -234,9 +252,13 @@ def _collect_all_steps(
     # Map future → chunk index to preserve order
     ordered_results: list[tuple[list[_AssertionStep], list[str]]] = [None] * len(chunks)  # type: ignore[list-item]
 
-    with ProcessPoolExecutor(max_workers=workers) as executor:
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(parsed,),
+    ) as executor:
         future_to_idx = {
-            executor.submit(_replay_chunk, parsed, chunk): idx
+            executor.submit(_replay_chunk, chunk): idx
             for idx, chunk in enumerate(chunks)
         }
         for future in as_completed(future_to_idx):
@@ -608,15 +630,16 @@ class TestQLmmExhaustive:
 
 
 def _replay_batch(
-    parsed: ParsedDatabase,
     labels: list[str],
 ) -> list[tuple[str, list[_AssertionStep] | str]]:
     """Worker: replay a batch of theorems and return [(label, steps_or_error)].
 
-    Builds label_info ONCE per worker invocation (amortised cost).
-    Top-level function required for ProcessPoolExecutor pickling.
+    Uses process-global _WORKER_PARSED and _WORKER_LABEL_INFO set by _init_worker.
+    Each submit() only pickles the lightweight label list.
     """
-    label_info = _build_label_info(parsed)
+    parsed = _WORKER_PARSED
+    label_info = _WORKER_LABEL_INFO
+    assert parsed is not None and label_info is not None
     return [
         (lbl, _replay_proof_extract_steps(parsed, lbl, label_info)) for lbl in labels
     ]
@@ -688,49 +711,31 @@ def _verify_streaming(
         pending.clear()
         gc.collect()
 
-    # Split theorems into mini-batches so each worker call amortises the cost
-    # of building label_info once per batch rather than once per theorem.
-    # Aim for ~256 theorems per worker call (tunable).
+    # Split theorems into mini-batches for worker calls.
+    # Use 256 theorems/batch: small enough for good load-balancing across
+    # heterogeneous proof sizes, large enough to amortise IPC overhead.
     replay_batch_size = max(1, min(256, (len(theorems) + workers - 1) // workers))
     replay_batches = [
         theorems[i : i + replay_batch_size]
         for i in range(0, len(theorems), replay_batch_size)
     ]
 
-    # Use ProcessPoolExecutor to parallelise proof replay across CPU cores.
-    # We maintain a bounded window of in-flight futures so we don't materialise
-    # all steps in memory at once. Results are consumed in submission order.
-    import collections
+    # Submit ALL batches upfront. Each task payload is just a list[str] of
+    # labels (~few KB), so memory is negligible. The pool's max_workers
+    # bounds actual parallelism — workers always have tasks queued and never
+    # starve, even while the main thread is blocked in _flush() doing GPU work.
+    # Futures are consumed in submission order (FIFO) for determinism.
+    with ProcessPoolExecutor(
+        max_workers=workers,
+        initializer=_init_worker,
+        initargs=(parsed,),
+    ) as executor:
+        all_futures = [
+            (batch, executor.submit(_replay_batch, batch))
+            for batch in replay_batches
+        ]
 
-    future_queue: collections.deque = collections.deque()
-    max_inflight = workers * 2  # keep the pool fed without unbounded memory
-
-    with ProcessPoolExecutor(max_workers=workers) as executor:
-        batch_iter = iter(enumerate(replay_batches))
-        exhausted = False
-
-        def _submit_next_batch() -> bool:
-            nonlocal exhausted
-            try:
-                _, batch = next(batch_iter)
-                fut = executor.submit(_replay_batch, parsed, batch)
-                future_queue.append((batch, fut))
-                return True
-            except StopIteration:
-                exhausted = True
-                return False
-
-        # Pre-fill the pipeline
-        for _ in range(min(max_inflight, len(replay_batches))):
-            _submit_next_batch()
-
-        while future_queue:
-            batch_labels, fut = future_queue.popleft()
-
-            # Keep the pipeline full while we wait for the oldest future
-            if not exhausted:
-                _submit_next_batch()
-
+        for batch_labels, fut in all_futures:
             t0 = time.perf_counter()
             batch_results = fut.result()  # list[(lbl, steps_or_err)]
             t_replay += time.perf_counter() - t0
@@ -895,7 +900,7 @@ class TestSetMMFull:
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         n_axioms = sum(1 for a in parsed.assertions.values() if a.type == "axiom")
-        step_budget = 1_000_000 if device.type == "cuda" else 5_000
+        step_budget = 500_000 if device.type == "cuda" else 5_000
         print(
             f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
             f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)"
