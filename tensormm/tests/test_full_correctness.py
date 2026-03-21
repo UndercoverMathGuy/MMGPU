@@ -1064,6 +1064,7 @@ def _verify_encoded_on_gpu(
         pat_t = torch.from_numpy(np.ascontiguousarray(patterns_np[start:end, :chunk_P]))
         pl_t = torch.from_numpy(np.ascontiguousarray(pat_lengths_s[start:end]))
         st_t = torch.from_numpy(np.ascontiguousarray(st))
+        del st  # free CPU copy
         sl_t = torch.from_numpy(np.ascontiguousarray(sub_lens_np[start:end]))
         tgt_t = torch.from_numpy(np.ascontiguousarray(targets_np[start:end, :chunk_T]))
         tl_t = torch.from_numpy(np.ascontiguousarray(tgt_lengths_s[start:end]))
@@ -1071,20 +1072,36 @@ def _verify_encoded_on_gpu(
         if use_metal:
             gpu_out = verifier.verify_flat(pat_t, pl_t, st_t, sl_t, tgt_t, tl_t)
         else:
-            gpu_out = verifier.verify_flat(
-                pat_t.to(device), pl_t.to(device), st_t.to(device),
-                sl_t.to(device), tgt_t.to(device), tl_t.to(device),
-            )
+            _ct0 = time.perf_counter()
+            pat_d = pat_t.to(device)
+            pl_d = pl_t.to(device)
+            st_d = st_t.to(device)
+            del st_t  # free CPU copy after transfer
+            sl_d = sl_t.to(device)
+            tgt_d = tgt_t.to(device)
+            tl_d = tl_t.to(device)
+            if device.type == "cuda":
+                _alloc = torch.cuda.memory_allocated(device) / (1024**2)
+                _resrv = torch.cuda.memory_reserved(device) / (1024**2)
+                print(f"        → to(device) {time.perf_counter()-_ct0:.2f}s, "
+                      f"VRAM alloc={_alloc:.0f}MB reserved={_resrv:.0f}MB", flush=True)
+            gpu_out = verifier.verify_flat(pat_d, pl_d, st_d, sl_d, tgt_d, tl_d)
+            del pat_d, pl_d, st_d, sl_d, tgt_d, tl_d
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+                print(f"        → verify_flat done {time.perf_counter()-_ct0:.2f}s", flush=True)
         gpu_results_sorted[start:end] = gpu_out.numpy()
         stats["steps_verified"] += B
         start = end
 
     _t_phase3 = time.perf_counter() - _t_phase3
-    print(f"    Phase 3 (GPU dispatch):  {_t_phase3:.2f}s  [{stats['steps_verified']:,} steps]")
+    print(f"    Phase 3 (GPU dispatch):  {_t_phase3:.2f}s  [{stats['steps_verified']:,} steps]", flush=True)
 
     # Unsort results
     gpu_results = np.empty(N, dtype=np.bool_)
     gpu_results[sort_order] = gpu_results_sorted
+    n_fail = int((~gpu_results).sum())
+    print(f"    Unsort done, {n_fail} failures detected", flush=True)
 
     gpu_failures: list[str] = []
     fail_indices = np.where(~gpu_results)[0]
@@ -1095,6 +1112,7 @@ def _verify_encoded_on_gpu(
             f"subst_vars={enc.subst_vars_per_step[j]}, "
             f"result_len={enc.tgt_len_per_step[j]}"
         )
+    print(f"    _verify_encoded_on_gpu returning", flush=True)
 
     return gpu_failures, stats
 
@@ -1161,7 +1179,9 @@ def _verify_streaming(
             )
         pending = []
         pending_steps = 0
+        print(f"  [{tag}] _flush done: {n_steps} steps, {dt:.2f}s, {len(fails)} failures", flush=True)
         gc.collect()
+        print(f"  [{tag}] gc.collect done", flush=True)
 
     # Split theorems into mini-batches for worker calls.
     replay_batch_size = max(1, min(256, (len(theorems) + workers - 1) // workers))
@@ -1184,7 +1204,7 @@ def _verify_streaming(
         ]
         if verbose:
             print(f"  [{tag}] All {len(all_futures)} replay+encode tasks submitted, "
-                  f"collecting results...")
+                  f"collecting results...", flush=True)
 
         for batch_labels, fut in all_futures:
             t0 = time.perf_counter()
@@ -1207,7 +1227,9 @@ def _verify_streaming(
                 if pending_steps >= step_budget:
                     _flush()
 
+    print(f"  [{tag}] All futures collected, final flush...", flush=True)
     _flush()  # remaining
+    print(f"  [{tag}] Exiting pool context manager...", flush=True)
 
     return gpu_failures, replay_errors, total_steps, t_replay, t_gpu, batch_stats
 
