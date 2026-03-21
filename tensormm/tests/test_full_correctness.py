@@ -20,7 +20,9 @@ GPU SATURATION STRATEGY:
 from __future__ import annotations
 
 import gc
+import multiprocessing
 import os
+import sys
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -83,6 +85,39 @@ class _AssertionStep:
     pattern: list[str]  # conclusion expression of the applied assertion
     substitution: dict[str, list[str]]  # variable -> replacement tokens
     expected_result: list[str]  # apply_substitution(pattern, subst)
+
+
+@dataclass
+class _EncodedBatch:
+    """Pre-encoded batch of assertion steps as numpy arrays.
+
+    Workers produce these during replay so the main thread never touches
+    pure-Python tokenization.  All arrays use int32 except offsets (int64).
+    """
+
+    # Per-step metadata for failure reporting (lightweight)
+    step_labels: list[str]       # step_label per step (for pattern cache key)
+    theorem_labels: list[str]    # theorem_label per step
+    step_indices: list[int]      # step_index per step
+    pat_len_per_step: list[int]  # len(pattern) per step (for failure msg)
+    tgt_len_per_step: list[int]  # len(expected_result) per step
+    subst_vars_per_step: list[list[str]]  # substitution keys per step
+
+    # Flat encoded arrays (match Phase 1 output format)
+    all_pat_toks: np.ndarray     # int32 — flat pattern token IDs
+    pat_lengths: np.ndarray      # int32 — pattern length per step
+    all_tgt_toks: np.ndarray     # int32 — flat target token IDs
+    tgt_lengths: np.ndarray      # int32 — target length per step
+    all_sub_step: np.ndarray     # int32 — step index per substitution entry
+    all_sub_var: np.ndarray      # int32 — variable token ID per subst entry
+    all_sub_len: np.ndarray      # int32 — replacement length per subst entry
+    all_sub_toks: np.ndarray     # int32 — flat replacement token IDs
+    per_step_S_max: np.ndarray   # int32 — max subst length per step
+    unique_token_ids: np.ndarray # int32 — set of all token IDs seen
+
+    @property
+    def num_steps(self) -> int:
+        return len(self.pat_lengths)
 
 
 def _build_label_info(parsed: ParsedDatabase) -> dict[str, tuple[str, object]]:
@@ -191,18 +226,57 @@ def _replay_proof_extract_steps(
 # ── Worker process globals (set once by _init_worker, avoid per-call pickling) ──
 _WORKER_PARSED: ParsedDatabase | None = None
 _WORKER_LABEL_INFO: dict[str, tuple[str, object]] | None = None
+_WORKER_SYMBOL_TO_ID: dict[str, int] | None = None
+
+# Cap workers: proof replay has diminishing returns past ~32 cores due to
+# IPC overhead for returning step lists. Also avoids 128-process fork storms.
+_MAX_REPLAY_WORKERS = 32
 
 
-def _init_worker(parsed: ParsedDatabase) -> None:
+def _init_worker(
+    parsed: ParsedDatabase,
+    symbol_to_id: dict[str, int] | None = None,
+) -> None:
     """ProcessPoolExecutor initializer — runs ONCE per worker process.
 
-    Stores the ParsedDatabase and pre-built label_info as process globals.
-    This means the (large) ParsedDatabase is pickled exactly `workers` times
-    at pool creation, NOT once per submit() call.
+    Stores the ParsedDatabase, pre-built label_info, and frozen symbol→ID
+    lookup as process globals.
     """
-    global _WORKER_PARSED, _WORKER_LABEL_INFO
+    global _WORKER_PARSED, _WORKER_LABEL_INFO, _WORKER_SYMBOL_TO_ID
     _WORKER_PARSED = parsed
     _WORKER_LABEL_INFO = _build_label_info(parsed)
+    if symbol_to_id is not None:
+        _WORKER_SYMBOL_TO_ID = symbol_to_id
+
+
+def _make_replay_pool(
+    parsed: ParsedDatabase,
+    max_workers: int | None = None,
+    symbol_to_id: dict[str, int] | None = None,
+) -> ProcessPoolExecutor:
+    """Create a ProcessPoolExecutor pre-loaded with ParsedDatabase.
+
+    On Linux: uses 'fork' context so children inherit parent memory — zero
+    pickle cost.  We set the module globals BEFORE creating the pool.
+    On macOS/Windows: falls back to initializer which pickles once per worker.
+    """
+    global _WORKER_PARSED, _WORKER_LABEL_INFO, _WORKER_SYMBOL_TO_ID
+    workers = min(max_workers or os.cpu_count() or 1, _MAX_REPLAY_WORKERS)
+
+    if sys.platform == "linux":
+        # Set globals in parent; fork'd children inherit them for free.
+        _WORKER_PARSED = parsed
+        _WORKER_LABEL_INFO = _build_label_info(parsed)
+        _WORKER_SYMBOL_TO_ID = symbol_to_id
+        ctx = multiprocessing.get_context("fork")
+        return ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+    else:
+        # macOS / Windows: use initializer (pickles once per worker at startup)
+        return ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_worker,
+            initargs=(parsed, symbol_to_id),
+        )
 
 
 def _replay_chunk(
@@ -242,7 +316,7 @@ def _collect_all_steps(
     if not theorem_labels:
         return [], []
 
-    workers = max_workers or os.cpu_count() or 1
+    workers = min(max_workers or os.cpu_count() or 1, _MAX_REPLAY_WORKERS)
     chunk_size = max(1, (len(theorem_labels) + workers - 1) // workers)
     chunks = [
         theorem_labels[i : i + chunk_size]
@@ -252,11 +326,7 @@ def _collect_all_steps(
     # Map future → chunk index to preserve order
     ordered_results: list[tuple[list[_AssertionStep], list[str]]] = [None] * len(chunks)  # type: ignore[list-item]
 
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_init_worker,
-        initargs=(parsed,),
-    ) as executor:
+    with _make_replay_pool(parsed, max_workers=workers) as executor:
         future_to_idx = {
             executor.submit(_replay_chunk, chunk): idx
             for idx, chunk in enumerate(chunks)
@@ -305,6 +375,7 @@ def _verify_steps_batched_on_gpu(
         verifier = TensorVerifier(device=device)
 
     # ── Phase 1: encode (Python — tokenizer API is inherently Python) ─
+    _t_phase1 = time.perf_counter()
 
     pattern_cache: dict[str, list[int]] = {}
     unique_groups: set[str] = set()
@@ -355,6 +426,9 @@ def _verify_steps_batched_on_gpu(
         all_tgt_toks.extend(tgt_ids)
         all_token_ids.update(tgt_ids)
 
+    _t_phase1 = time.perf_counter() - _t_phase1
+    print(f"    Phase 1 (Python encode): {_t_phase1:.2f}s  [{N:,} steps]")
+
     # ── Build compact vocab as numpy LUT ──────────────────────────────
     sorted_ids = sorted(all_token_ids)
     max_full_id = max(sorted_ids) + 1
@@ -372,6 +446,7 @@ def _verify_steps_batched_on_gpu(
     }
 
     # ── Phase 2: PURE NUMPY — sort, remap, pack ──────────────────────
+    _t_phase2 = time.perf_counter()
     all_pat_toks_np = np.array(all_pat_toks, dtype=np.int32)
     pat_offsets_np = np.array(pat_offsets, dtype=np.int64)
     pat_lengths_np = np.array(pat_lengths, dtype=np.int32)
@@ -454,7 +529,11 @@ def _verify_steps_batched_on_gpu(
         sp_offsets_np[0] = 0
         np.cumsum(sp_len_np[:-1].astype(np.int64), out=sp_offsets_np[1:])
 
+    _t_phase2 = time.perf_counter() - _t_phase2
+    print(f"    Phase 2 (numpy pack):    {_t_phase2:.2f}s  [N={N:,}, P_max={P_max}, T_max={T_max}, V={V}]")
+
     # ── Phase 3: chunked GPU dispatch — adaptive chunk size ─────────
+    _t_phase3 = time.perf_counter()
     # H100 NVL: 188GB HBM3, M1: 8GB unified — scale budget accordingly
     if device.type == "cuda":
         GPU_MEM_BUDGET = 188 * 1024 * 1024 * 1024  # 188 GB — saturate the H100 NVL
@@ -524,6 +603,9 @@ def _verify_steps_batched_on_gpu(
         gpu_results_sorted[start:end] = gpu_out.numpy()
         stats["steps_verified"] += B
         start = end
+
+    _t_phase3 = time.perf_counter() - _t_phase3
+    print(f"    Phase 3 (GPU dispatch):  {_t_phase3:.2f}s  [{stats['steps_verified']:,} steps verified]")
 
     # Unsort results
     gpu_results = np.empty(N, dtype=np.bool_)
@@ -645,6 +727,361 @@ def _replay_batch(
     ]
 
 
+def _replay_batch_encoded(
+    labels: list[str],
+) -> tuple[_EncodedBatch | None, list[str]]:
+    """Worker: replay theorems AND encode to int arrays in one pass.
+
+    Uses _WORKER_SYMBOL_TO_ID to encode strings → ints during replay.
+    Returns (_EncodedBatch, replay_errors). Batch is None if no steps.
+    """
+    parsed = _WORKER_PARSED
+    label_info = _WORKER_LABEL_INFO
+    sym2id = _WORKER_SYMBOL_TO_ID
+    assert parsed is not None and label_info is not None and sym2id is not None
+
+    # Accumulators — Python lists, converted to numpy once at the end
+    meta_step_labels: list[str] = []
+    meta_theorem_labels: list[str] = []
+    meta_step_indices: list[int] = []
+    meta_pat_lens: list[int] = []
+    meta_tgt_lens: list[int] = []
+    meta_subst_vars: list[list[str]] = []
+
+    all_pat_toks: list[int] = []
+    pat_lengths: list[int] = []
+    all_tgt_toks: list[int] = []
+    tgt_lengths: list[int] = []
+    all_sub_step: list[int] = []
+    all_sub_var: list[int] = []
+    all_sub_len: list[int] = []
+    all_sub_toks: list[int] = []
+    per_step_S_max: list[int] = []
+    token_id_set: set[int] = {0}
+
+    pattern_cache: dict[str, list[int]] = {}
+    replay_errors: list[str] = []
+    step_idx = 0
+
+    for lbl in labels:
+        extracted = _replay_proof_extract_steps(parsed, lbl, label_info)
+        if isinstance(extracted, str):
+            replay_errors.append(f"  REPLAY ERR  {lbl}: {extracted}")
+            continue
+        for astep in extracted:
+            if astep.step_label not in pattern_cache:
+                pattern_cache[astep.step_label] = [sym2id[s] for s in astep.pattern]
+            pat_ids = pattern_cache[astep.step_label]
+            pat_lengths.append(len(pat_ids))
+            all_pat_toks.extend(pat_ids)
+            token_id_set.update(pat_ids)
+
+            s_max = 1
+            for var, replacement in astep.substitution.items():
+                var_id = sym2id[var]
+                rep_ids = [sym2id[s] for s in replacement]
+                all_sub_step.append(step_idx)
+                all_sub_var.append(var_id)
+                all_sub_len.append(len(rep_ids))
+                all_sub_toks.extend(rep_ids)
+                token_id_set.add(var_id)
+                token_id_set.update(rep_ids)
+                if len(rep_ids) > s_max:
+                    s_max = len(rep_ids)
+            per_step_S_max.append(s_max)
+
+            tgt_ids = [sym2id[s] for s in astep.expected_result]
+            tgt_lengths.append(len(tgt_ids))
+            all_tgt_toks.extend(tgt_ids)
+            token_id_set.update(tgt_ids)
+
+            meta_step_labels.append(astep.step_label)
+            meta_theorem_labels.append(astep.theorem_label)
+            meta_step_indices.append(astep.step_index)
+            meta_pat_lens.append(len(astep.pattern))
+            meta_tgt_lens.append(len(astep.expected_result))
+            meta_subst_vars.append(list(astep.substitution.keys()))
+            step_idx += 1
+
+    if step_idx == 0:
+        return None, replay_errors
+
+    return _EncodedBatch(
+        step_labels=meta_step_labels,
+        theorem_labels=meta_theorem_labels,
+        step_indices=meta_step_indices,
+        pat_len_per_step=meta_pat_lens,
+        tgt_len_per_step=meta_tgt_lens,
+        subst_vars_per_step=meta_subst_vars,
+        all_pat_toks=np.array(all_pat_toks, dtype=np.int32),
+        pat_lengths=np.array(pat_lengths, dtype=np.int32),
+        all_tgt_toks=np.array(all_tgt_toks, dtype=np.int32),
+        tgt_lengths=np.array(tgt_lengths, dtype=np.int32),
+        all_sub_step=np.array(all_sub_step, dtype=np.int32),
+        all_sub_var=np.array(all_sub_var, dtype=np.int32),
+        all_sub_len=np.array(all_sub_len, dtype=np.int32),
+        all_sub_toks=np.array(all_sub_toks, dtype=np.int32),
+        per_step_S_max=np.array(per_step_S_max, dtype=np.int32),
+        unique_token_ids=np.array(sorted(token_id_set), dtype=np.int32),
+    ), replay_errors
+
+
+def _concat_encoded_batches(batches: list[_EncodedBatch]) -> _EncodedBatch:
+    """Concatenate multiple _EncodedBatch into one, rebasing step indices."""
+    if len(batches) == 1:
+        return batches[0]
+
+    step_labels: list[str] = []
+    theorem_labels: list[str] = []
+    step_indices: list[int] = []
+    pat_len_meta: list[int] = []
+    tgt_len_meta: list[int] = []
+    subst_vars_meta: list[list[str]] = []
+
+    pat_toks_parts: list[np.ndarray] = []
+    pat_len_parts: list[np.ndarray] = []
+    tgt_toks_parts: list[np.ndarray] = []
+    tgt_len_parts: list[np.ndarray] = []
+    sub_step_parts: list[np.ndarray] = []
+    sub_var_parts: list[np.ndarray] = []
+    sub_len_parts: list[np.ndarray] = []
+    sub_toks_parts: list[np.ndarray] = []
+    s_max_parts: list[np.ndarray] = []
+    token_set_parts: list[np.ndarray] = []
+
+    step_offset = 0
+    for b in batches:
+        n = b.num_steps
+        step_labels.extend(b.step_labels)
+        theorem_labels.extend(b.theorem_labels)
+        step_indices.extend(b.step_indices)
+        pat_len_meta.extend(b.pat_len_per_step)
+        tgt_len_meta.extend(b.tgt_len_per_step)
+        subst_vars_meta.extend(b.subst_vars_per_step)
+
+        pat_toks_parts.append(b.all_pat_toks)
+        pat_len_parts.append(b.pat_lengths)
+        tgt_toks_parts.append(b.all_tgt_toks)
+        tgt_len_parts.append(b.tgt_lengths)
+        sub_step_parts.append(b.all_sub_step + step_offset)
+        sub_var_parts.append(b.all_sub_var)
+        sub_len_parts.append(b.all_sub_len)
+        sub_toks_parts.append(b.all_sub_toks)
+        s_max_parts.append(b.per_step_S_max)
+        token_set_parts.append(b.unique_token_ids)
+        step_offset += n
+
+    return _EncodedBatch(
+        step_labels=step_labels,
+        theorem_labels=theorem_labels,
+        step_indices=step_indices,
+        pat_len_per_step=pat_len_meta,
+        tgt_len_per_step=tgt_len_meta,
+        subst_vars_per_step=subst_vars_meta,
+        all_pat_toks=np.concatenate(pat_toks_parts),
+        pat_lengths=np.concatenate(pat_len_parts),
+        all_tgt_toks=np.concatenate(tgt_toks_parts),
+        tgt_lengths=np.concatenate(tgt_len_parts),
+        all_sub_step=np.concatenate(sub_step_parts),
+        all_sub_var=np.concatenate(sub_var_parts),
+        all_sub_len=np.concatenate(sub_len_parts),
+        all_sub_toks=np.concatenate(sub_toks_parts),
+        per_step_S_max=np.concatenate(s_max_parts),
+        unique_token_ids=np.unique(np.concatenate(token_set_parts)),
+    )
+
+
+def _verify_encoded_on_gpu(
+    enc: _EncodedBatch,
+    device: torch.device,
+    chunk_size: int = 2000,
+) -> tuple[list[str], dict[str, int]]:
+    """Verify pre-encoded steps on GPU — Phase 1 eliminated.
+
+    Takes _EncodedBatch (numpy arrays from workers) directly.
+    Only Phase 2 (numpy pack) and Phase 3 (GPU dispatch) remain.
+    """
+    N = enc.num_steps
+    if N == 0:
+        return [], {"total_steps": 0, "num_groups": 0, "max_batch": 0,
+                     "steps_verified": 0, "compact_vocab": 0}
+
+    use_metal = device.type == "mps" and METAL_AVAILABLE
+    verifier = MetalVerifier() if use_metal else TensorVerifier(device=device)
+
+    # ── Build compact vocab LUT ──────────────────────────────────────
+    _t_phase2 = time.perf_counter()
+
+    sorted_ids = enc.unique_token_ids  # already sorted from workers
+    max_full_id = int(sorted_ids[-1]) + 1
+    f2c_lut = np.zeros(max_full_id, dtype=np.int32)
+    f2c_lut[sorted_ids] = np.arange(len(sorted_ids), dtype=np.int32)
+    V = len(sorted_ids)
+
+    stats: dict[str, int] = {
+        "total_steps": N, "num_groups": len(set(enc.step_labels)),
+        "max_batch": N, "steps_verified": 0, "compact_vocab": V,
+    }
+
+    # ── Phase 2: numpy remap, sort, pack ─────────────────────────────
+    all_pat_toks_c = f2c_lut[enc.all_pat_toks]
+    all_tgt_toks_c = f2c_lut[enc.all_tgt_toks]
+    all_sub_toks_c = f2c_lut[enc.all_sub_toks] if len(enc.all_sub_toks) else enc.all_sub_toks
+    all_sub_var_c = f2c_lut[enc.all_sub_var] if len(enc.all_sub_var) else enc.all_sub_var
+
+    pat_lengths_np = enc.pat_lengths
+    tgt_lengths_np = enc.tgt_lengths
+    s_max_np = enc.per_step_S_max
+    all_sub_step_np = enc.all_sub_step
+    all_sub_len_np = enc.all_sub_len
+
+    # Build offsets from lengths
+    pat_offsets_np = np.empty(N, dtype=np.int64)
+    if N > 0:
+        pat_offsets_np[0] = 0
+        if N > 1:
+            np.cumsum(pat_lengths_np[:-1].astype(np.int64), out=pat_offsets_np[1:])
+
+    tgt_offsets_np = np.empty(N, dtype=np.int64)
+    if N > 0:
+        tgt_offsets_np[0] = 0
+        if N > 1:
+            np.cumsum(tgt_lengths_np[:-1].astype(np.int64), out=tgt_offsets_np[1:])
+
+    # Sort order: (P_len, S_max)
+    sort_order = np.lexsort((s_max_np, pat_lengths_np))
+    inv_sort = np.empty_like(sort_order)
+    inv_sort[sort_order] = np.arange(N)
+
+    pat_lengths_s = pat_lengths_np[sort_order]
+    pat_offsets_s = pat_offsets_np[sort_order]
+    tgt_lengths_s = tgt_lengths_np[sort_order]
+    tgt_offsets_s = tgt_offsets_np[sort_order]
+    s_max_s = s_max_np[sort_order]
+
+    P_max = int(pat_lengths_s.max())
+    T_max = max(int(tgt_lengths_s.max()), 1)
+
+    # Pack patterns [N, P_max]
+    pat_lens_i64 = pat_lengths_s.astype(np.int64)
+    total_pat_toks = int(pat_lens_i64.sum())
+    step_idx_p = np.repeat(np.arange(N, dtype=np.int32), pat_lengths_s)
+    pat_cumstart = np.repeat(np.cumsum(pat_lens_i64) - pat_lens_i64, pat_lengths_s)
+    pos_within = (np.arange(total_pat_toks, dtype=np.int64) - pat_cumstart).astype(np.int32)
+    src_idx_p = np.repeat(pat_offsets_s, pat_lengths_s) + pos_within
+    patterns_np = np.zeros((N, P_max), dtype=np.int32)
+    patterns_np[step_idx_p, pos_within] = all_pat_toks_c[src_idx_p]
+
+    # Pack targets [N, T_max]
+    tgt_lens_i64 = tgt_lengths_s.astype(np.int64)
+    total_tgt_toks = int(tgt_lens_i64.sum())
+    step_idx_t = np.repeat(np.arange(N, dtype=np.int32), tgt_lengths_s)
+    tgt_cumstart = np.repeat(np.cumsum(tgt_lens_i64) - tgt_lens_i64, tgt_lengths_s)
+    pos_within_t = (np.arange(total_tgt_toks, dtype=np.int64) - tgt_cumstart).astype(np.int32)
+    src_idx_t = np.repeat(tgt_offsets_s, tgt_lengths_s) + pos_within_t
+    targets_np = np.zeros((N, T_max), dtype=np.int32)
+    targets_np[step_idx_t, pos_within_t] = all_tgt_toks_c[src_idx_t]
+
+    # Pack sub_lens [N, V]
+    sub_lens_np = np.ones((N, V), dtype=np.int32)
+    if len(all_sub_step_np):
+        sorted_sub_step = inv_sort[all_sub_step_np].astype(np.int32)
+        sub_lens_np[sorted_sub_step, all_sub_var_c] = all_sub_len_np
+    else:
+        sorted_sub_step = np.empty(0, dtype=np.int32)
+
+    # Sparse subst arrays
+    sp_step_np = sorted_sub_step
+    sp_var_np = all_sub_var_c
+    sp_len_np = all_sub_len_np
+    sp_toks_np = all_sub_toks_c
+    sp_offsets_np = np.empty(len(sp_len_np), dtype=np.int64)
+    if len(sp_len_np):
+        sp_offsets_np[0] = 0
+        np.cumsum(sp_len_np[:-1].astype(np.int64), out=sp_offsets_np[1:])
+
+    _t_phase2 = time.perf_counter() - _t_phase2
+    print(f"    Phase 2 (numpy pack):    {_t_phase2:.2f}s  [N={N:,}, P={P_max}, T={T_max}, V={V}]")
+
+    # ── Phase 3: chunked GPU dispatch ────────────────────────────────
+    _t_phase3 = time.perf_counter()
+    if device.type == "cuda":
+        GPU_MEM_BUDGET = 99 * 1024 * 1024 * 1024
+    else:
+        GPU_MEM_BUDGET = 512 * 1024 * 1024
+
+    gpu_results_sorted = np.empty(N, dtype=np.bool_)
+    start = 0
+    while start < N:
+        probe_end = min(start + chunk_size, N)
+        chunk_S = max(int(s_max_s[start:probe_end].max()), 1)
+        max_B = max(GPU_MEM_BUDGET // (V * chunk_S * 4), 64)
+        B = min(probe_end - start, max_B)
+        end = start + B
+
+        chunk_P = int(pat_lengths_s[start:end].max())
+        chunk_T = max(int(tgt_lengths_s[start:end].max()), 1)
+        chunk_S = max(int(s_max_s[start:end].max()), 1)
+
+        st = np.zeros((B, V, chunk_S), dtype=np.int32)
+        ident = np.arange(V, dtype=np.int32)
+        st[:, :, 0] = ident[np.newaxis, :]
+
+        mask = (sp_step_np >= start) & (sp_step_np < end)
+        if mask.any():
+            c_step = sp_step_np[mask] - start
+            c_var = sp_var_np[mask]
+            c_len = sp_len_np[mask]
+            c_off = sp_offsets_np[mask]
+            rc = c_len.astype(np.int64)
+            total_toks = int(rc.sum())
+            if total_toks > 0:
+                sc_step = np.repeat(c_step, rc)
+                sc_var = np.repeat(c_var, rc)
+                offsets_within = np.repeat(np.cumsum(rc) - rc, rc)
+                sc_s = (np.arange(total_toks, dtype=np.int64) - offsets_within).astype(np.int32)
+                sc_tok_idx = np.repeat(c_off, rc) + sc_s.astype(np.int64)
+                sc_tok = sp_toks_np[sc_tok_idx]
+                st[sc_step, sc_var, sc_s] = sc_tok
+
+        pat_t = torch.from_numpy(np.ascontiguousarray(patterns_np[start:end, :chunk_P]))
+        pl_t = torch.from_numpy(np.ascontiguousarray(pat_lengths_s[start:end]))
+        st_t = torch.from_numpy(np.ascontiguousarray(st))
+        sl_t = torch.from_numpy(np.ascontiguousarray(sub_lens_np[start:end]))
+        tgt_t = torch.from_numpy(np.ascontiguousarray(targets_np[start:end, :chunk_T]))
+        tl_t = torch.from_numpy(np.ascontiguousarray(tgt_lengths_s[start:end]))
+
+        if use_metal:
+            gpu_out = verifier.verify_flat(pat_t, pl_t, st_t, sl_t, tgt_t, tl_t)
+        else:
+            gpu_out = verifier.verify_flat(
+                pat_t.to(device), pl_t.to(device), st_t.to(device),
+                sl_t.to(device), tgt_t.to(device), tl_t.to(device),
+            )
+        gpu_results_sorted[start:end] = gpu_out.numpy()
+        stats["steps_verified"] += B
+        start = end
+
+    _t_phase3 = time.perf_counter() - _t_phase3
+    print(f"    Phase 3 (GPU dispatch):  {_t_phase3:.2f}s  [{stats['steps_verified']:,} steps]")
+
+    # Unsort results
+    gpu_results = np.empty(N, dtype=np.bool_)
+    gpu_results[sort_order] = gpu_results_sorted
+
+    gpu_failures: list[str] = []
+    fail_indices = np.where(~gpu_results)[0]
+    for j in fail_indices:
+        gpu_failures.append(
+            f"  GPU FAIL  {enc.theorem_labels[j]} step {enc.step_indices[j]} "
+            f"({enc.step_labels[j]}): pattern_len={enc.pat_len_per_step[j]}, "
+            f"subst_vars={enc.subst_vars_per_step[j]}, "
+            f"result_len={enc.tgt_len_per_step[j]}"
+        )
+
+    return gpu_failures, stats
+
+
 def _verify_streaming(
     parsed: ParsedDatabase,
     theorems: list[str],
@@ -658,14 +1095,13 @@ def _verify_streaming(
 ) -> tuple[list[str], list[str], int, float, float, list[dict]]:
     """Replay theorems in parallel and verify on GPU in streaming mega-batches.
 
-    Uses ProcessPoolExecutor to run proof replay across CPU cores, bypassing
-    the GIL. Each worker replays one theorem and returns its steps. The main
-    process collects results in order, accumulates into pending until
-    step_budget is reached, then flushes to GPU.
+    Workers replay proofs AND encode strings → int arrays in parallel.
+    Main thread only does numpy concatenation + GPU dispatch — zero
+    pure-Python tokenization.
 
     Returns (gpu_failures, replay_errors, total_steps, t_replay, t_gpu, batch_stats).
     """
-    workers = max_workers or os.cpu_count() or 1
+    workers = min(max_workers or os.cpu_count() or 1, _MAX_REPLAY_WORKERS)
     gpu_failures: list[str] = []
     replay_errors: list[str] = []
     total_steps = 0
@@ -674,28 +1110,26 @@ def _verify_streaming(
     batch_stats: list[dict] = []
     theorems_replayed = 0
 
-    pending: list[_AssertionStep] = []
+    pending: list[_EncodedBatch] = []
+    pending_steps = 0
 
     def _flush() -> None:
-        nonlocal t_gpu
+        nonlocal t_gpu, pending, pending_steps
         if not pending:
             return
+        enc = _concat_encoded_batches(pending)
+        n_steps = enc.num_steps
         t0 = time.perf_counter()
-        fails, stats = _verify_steps_batched_on_gpu(
-            pending,
-            tokenizer,
-            is_variable,
-            device,
-        )
+        fails, stats = _verify_encoded_on_gpu(enc, device)
         dt = time.perf_counter() - t0
         t_gpu += dt
         gpu_failures.extend(fails)
         batch_stats.append(
             {
                 "batch": len(batch_stats) + 1,
-                "steps": len(pending),
+                "steps": n_steps,
                 "gpu_time": dt,
-                "steps_per_sec": len(pending) / dt if dt > 0 else 0,
+                "steps_per_sec": n_steps / dt if dt > 0 else 0,
                 "vocab": stats.get("compact_vocab", 0),
                 "failures": len(fails),
             }
@@ -708,59 +1142,52 @@ def _verify_streaming(
                 f"({bs['steps_per_sec']:,.0f} steps/s) "
                 f"V={bs['vocab']} failures={bs['failures']}"
             )
-        pending.clear()
+        pending = []
+        pending_steps = 0
         gc.collect()
 
     # Split theorems into mini-batches for worker calls.
-    # Use 256 theorems/batch: small enough for good load-balancing across
-    # heterogeneous proof sizes, large enough to amortise IPC overhead.
     replay_batch_size = max(1, min(256, (len(theorems) + workers - 1) // workers))
     replay_batches = [
         theorems[i : i + replay_batch_size]
         for i in range(0, len(theorems), replay_batch_size)
     ]
 
-    # Submit ALL batches upfront. Each task payload is just a list[str] of
-    # labels (~few KB), so memory is negligible. The pool's max_workers
-    # bounds actual parallelism — workers always have tasks queued and never
-    # starve, even while the main thread is blocked in _flush() doing GPU work.
-    # Futures are consumed in submission order (FIFO) for determinism.
-    with ProcessPoolExecutor(
-        max_workers=workers,
-        initializer=_init_worker,
-        initargs=(parsed,),
-    ) as executor:
+    # Workers need the frozen symbol→ID mapping for encoding.
+    symbol_to_id = tokenizer.symbol_to_id
+
+    if verbose:
+        print(f"  [{tag}] Creating pool: {workers} workers, "
+              f"{len(replay_batches)} batches of ~{replay_batch_size} theorems")
+    with _make_replay_pool(parsed, max_workers=workers,
+                           symbol_to_id=symbol_to_id) as executor:
         all_futures = [
-            (batch, executor.submit(_replay_batch, batch))
+            (batch, executor.submit(_replay_batch_encoded, batch))
             for batch in replay_batches
         ]
+        if verbose:
+            print(f"  [{tag}] All {len(all_futures)} replay+encode tasks submitted, "
+                  f"collecting results...")
 
         for batch_labels, fut in all_futures:
             t0 = time.perf_counter()
-            batch_results = fut.result()  # list[(lbl, steps_or_err)]
+            enc_batch, errs = fut.result()
             t_replay += time.perf_counter() - t0
             theorems_replayed += len(batch_labels)
+            replay_errors.extend(errs)
 
             if verbose and theorems_replayed % 5000 < len(batch_labels):
                 print(
                     f"  [{tag}] Replay: {theorems_replayed:,}/{len(theorems):,} theorems, "
-                    f"{total_steps + len(pending):,} steps, {t_replay:.1f}s"
+                    f"{total_steps + pending_steps:,} steps, {t_replay:.1f}s"
                 )
 
-            for lbl, extracted in batch_results:
-                # Free proof data in the main process after the worker is done
-                a = parsed.assertions[lbl]
-                a.proof = None
-                a.compressed_proof = None
+            if enc_batch is not None:
+                total_steps += enc_batch.num_steps
+                pending.append(enc_batch)
+                pending_steps += enc_batch.num_steps
 
-                if isinstance(extracted, str):
-                    replay_errors.append(f"  REPLAY ERR  {lbl}: {extracted}")
-                    continue
-
-                total_steps += len(extracted)
-                pending.extend(extracted)
-
-                if len(pending) >= step_budget:
+                if pending_steps >= step_budget:
                     _flush()
 
     _flush()  # remaining

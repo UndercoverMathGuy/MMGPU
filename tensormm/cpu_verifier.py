@@ -3,11 +3,25 @@
 from __future__ import annotations
 
 import itertools
+import multiprocessing
 import os
+import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from tensormm.parser import ParsedDatabase
+
+# Cap workers to avoid diminishing returns on many-core systems.
+_MAX_CPU_WORKERS = 32
+
+# Worker process global — set by _init_cpu_worker or inherited via fork.
+_CPU_WORKER_PARSED: ParsedDatabase | None = None
+
+
+def _init_cpu_worker(parsed: ParsedDatabase) -> None:
+    """ProcessPoolExecutor initializer for non-fork platforms."""
+    global _CPU_WORKER_PARSED
+    _CPU_WORKER_PARSED = parsed
 
 
 @dataclass
@@ -39,15 +53,15 @@ def apply_substitution(expression: Stmt, substitution: dict[str, Stmt]) -> Stmt:
 
 
 def _verify_chunk(
-    parsed: ParsedDatabase,
     labels: list[str],
 ) -> dict[str, "VerificationResult"]:
     """Worker function for ProcessPoolExecutor.
 
-    Creates a CPUVerifier in the worker process and verifies the given labels.
-    Must be a top-level function to be picklable.
+    Uses process-global _CPU_WORKER_PARSED (set by initializer or inherited
+    via fork). Creates a CPUVerifier in the worker and verifies the labels.
     """
-    verifier = CPUVerifier(parsed)
+    assert _CPU_WORKER_PARSED is not None
+    verifier = CPUVerifier(_CPU_WORKER_PARSED)
     return {lbl: verifier.verify_proof(lbl) for lbl in labels}
 
 
@@ -253,20 +267,32 @@ class CPUVerifier:
         if not theorem_labels:
             return {}
 
-        workers = max_workers or os.cpu_count() or 1
+        global _CPU_WORKER_PARSED
+        workers = min(max_workers or os.cpu_count() or 1, _MAX_CPU_WORKERS)
         results: dict[str, VerificationResult] = {}
 
-        # Each worker process gets the full ParsedDatabase (picklable dataclass)
-        # and verifies a chunk of theorems independently.
         chunk_size = max(1, (len(theorem_labels) + workers - 1) // workers)
         chunks = [
             theorem_labels[i : i + chunk_size]
             for i in range(0, len(theorem_labels), chunk_size)
         ]
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        # On Linux: fork inherits parent memory — zero pickle cost.
+        # On macOS/Windows: use initializer (pickles once per worker).
+        if sys.platform == "linux":
+            _CPU_WORKER_PARSED = self.db
+            ctx = multiprocessing.get_context("fork")
+            pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+        else:
+            pool = ProcessPoolExecutor(
+                max_workers=workers,
+                initializer=_init_cpu_worker,
+                initargs=(self.db,),
+            )
+
+        with pool as executor:
             futures = {
-                executor.submit(_verify_chunk, self.db, chunk): chunk
+                executor.submit(_verify_chunk, chunk): chunk
                 for chunk in chunks
             }
             for future in as_completed(futures):
