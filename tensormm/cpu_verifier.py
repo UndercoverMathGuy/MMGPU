@@ -87,8 +87,20 @@ class CPUVerifier:
             stmt_type = "$a" if assertion.type == "axiom" else "$p"
             self._label_info[lbl] = (stmt_type, assertion)
 
-    def _treat_step(self, label: str, stack: list[Stmt]) -> None:
-        """Process a single proof step by label, modifying the stack in place."""
+    def _treat_step(
+        self,
+        label: str,
+        stack: list[Stmt],
+        active_dvs: set[tuple[str, str]] | None = None,
+    ) -> None:
+        """Process a single proof step by label, modifying the stack in place.
+
+        active_dvs: all $d pairs active in the scope of the theorem being
+        proved.  Needed for the full Metamath $d check: when an invoked
+        assertion has $d x y, every pair of variables (x0, y0) drawn from
+        subst(x) and subst(y) must satisfy x0 != y0 AND $d x0 y0 must be
+        active.
+        """
         if label not in self._label_info:
             raise ValueError(f"Unknown label in proof: {label}")
 
@@ -149,6 +161,14 @@ class CPUVerifier:
                             f"Disjoint variable violation in {label}: "
                             f"{x0} appears in substitutions for both {x} and {y}"
                         )
+                    if active_dvs is not None:
+                        pair = (min(x0, y0), max(x0, y0))
+                        if pair not in active_dvs:
+                            raise ValueError(
+                                f"Disjoint variable violation in {label}: "
+                                f"${label} requires $d {x} {y}, substitution maps to "
+                                f"{x0} and {y0} but no active $d {x0} {y0}"
+                            )
 
             # Pop consumed entries and push the substituted conclusion
             del stack[len(stack) - npop :]
@@ -177,6 +197,7 @@ class CPUVerifier:
 
         stack: list[Stmt] = []
         steps = 0
+        active_dvs = assertion.all_disjoint_vars or None
 
         try:
             if assertion.compressed_proof is not None:
@@ -194,7 +215,7 @@ class CPUVerifier:
                         saved_stmts.append(list(stack[-1]))
                     elif proof_int < label_end:
                         # Reference a label
-                        self._treat_step(plabels[proof_int], stack)
+                        self._treat_step(plabels[proof_int], stack, active_dvs)
                         steps += 1
                     else:
                         # Reference a saved statement
@@ -210,7 +231,7 @@ class CPUVerifier:
             elif assertion.proof is not None:
                 # Uncompressed proof: each token is a label
                 for step_label in assertion.proof:
-                    self._treat_step(step_label, stack)
+                    self._treat_step(step_label, stack, active_dvs)
                     steps += 1
             else:
                 return VerificationResult(

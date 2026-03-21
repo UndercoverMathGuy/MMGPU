@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 
@@ -38,6 +39,7 @@ class Assertion:
     proof: list[str] | None    # proof steps as labels (None for axioms), uncompressed
     compressed_proof: CompressedProof | None  # structured compressed proof data
     disjoint_vars: list[tuple[str, str]]
+    all_disjoint_vars: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass
@@ -128,6 +130,18 @@ class _FrameStack:
                 pair = (min(v1, v2), max(v1, v2))
                 frame.disjoint_vars.add(pair)
 
+    def lookup_d(self, x: str, y: str) -> bool:
+        """Return True if $d x y (or $d y x) is active in any frame."""
+        pair = (min(x, y), max(x, y))
+        return any(pair in f.disjoint_vars for f in self.frames)
+
+    def all_active_dvs(self) -> set[tuple[str, str]]:
+        """Return the set of all active $d pairs across all frames."""
+        result: set[tuple[str, str]] = set()
+        for f in self.frames:
+            result |= f.disjoint_vars
+        return result
+
     def is_variable(self, tok: str) -> bool:
         return any(tok in f.variables for f in self.frames)
 
@@ -185,16 +199,63 @@ class _FrameStack:
         return f_labels, e_labels, dvs
 
 
+def _tokenize_file(
+    filepath: str,
+    _included: set[str] | None = None,
+) -> list[str]:
+    """Read a .mm file and return whitespace-delimited tokens.
+
+    Resolves $[ filename $] include directives recursively.
+    Included file paths are relative to the directory of the including file.
+    Cycle detection prevents infinite recursion.
+    """
+    abs_path = os.path.abspath(filepath)
+    if _included is None:
+        _included = set()
+    if abs_path in _included:
+        return []  # already included — skip silently per Metamath spec
+    _included.add(abs_path)
+
+    base_dir = os.path.dirname(abs_path)
+    with open(abs_path, "r", encoding="ascii", errors="replace") as f:
+        raw_tokens = f.read().split()
+
+    result: list[str] = []
+    i = 0
+    while i < len(raw_tokens):
+        # Skip comments — $( ... $) must be stripped before include resolution
+        if raw_tokens[i] == "$(":
+            i += 1
+            while i < len(raw_tokens) and raw_tokens[i] != "$)":
+                i += 1
+            i += 1  # skip $)
+            continue
+
+        if raw_tokens[i] == "$[":
+            # $[ filename $]  — three tokens
+            if i + 2 >= len(raw_tokens) or raw_tokens[i + 2] != "$]":
+                raise ValueError(
+                    f"Malformed $[ include in {filepath}: "
+                    f"expected '$[ filename $]'"
+                )
+            inc_name = raw_tokens[i + 1]
+            inc_path = os.path.join(base_dir, inc_name)
+            result.extend(_tokenize_file(inc_path, _included))
+            i += 3
+        else:
+            result.append(raw_tokens[i])
+            i += 1
+    return result
+
+
 def parse_mm_file(filepath: str) -> ParsedDatabase:
     """Parse a .mm file and return structured data.
 
-    Reads the entire file, splits into whitespace-delimited tokens,
-    and processes them sequentially with a scope stack.
+    Reads the file (resolving $[ ... $] includes), splits into
+    whitespace-delimited tokens, and processes them sequentially
+    with a scope stack.
     """
-    with open(filepath, "r", encoding="ascii", errors="replace") as f:
-        raw = f.read()
-
-    tokens = raw.split()
+    tokens = _tokenize_file(filepath)
     db = ParsedDatabase()
     fs = _FrameStack()
     fs.push()  # global scope
@@ -322,6 +383,7 @@ def parse_mm_file(filepath: str) -> ParsedDatabase:
                 proof=None,
                 compressed_proof=None,
                 disjoint_vars=dvs,
+                all_disjoint_vars=fs.all_active_dvs(),
             )
             db.assertions[label] = assertion
             label = None
@@ -384,6 +446,7 @@ def parse_mm_file(filepath: str) -> ParsedDatabase:
                 proof=uncompressed_proof,
                 compressed_proof=compressed_proof,
                 disjoint_vars=dvs,
+                all_disjoint_vars=fs.all_active_dvs(),
             )
             db.assertions[label] = assertion
             label = None

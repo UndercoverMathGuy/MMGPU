@@ -28,7 +28,15 @@ else:
     print("FATAL: No GPU detected (need CUDA or MPS). Exiting.")
     sys.exit(1)
 
-print(f"Using device: {device} ({backend})\n")
+print(f"Using device: {device} ({backend})")
+
+# ── CUDA warmup — force lazy init before any timed work ───────────
+if device.type == "cuda":
+    _t_warm = time.perf_counter()
+    _ = torch.zeros(1, device=device)  # triggers context + allocator init
+    torch.cuda.synchronize()
+    print(f"CUDA warmup: {time.perf_counter() - _t_warm:.1f}s")
+print()
 
 # ── Locate set.mm ──────────────────────────────────────────────────
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
