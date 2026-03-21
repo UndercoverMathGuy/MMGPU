@@ -534,19 +534,26 @@ def _verify_steps_batched_on_gpu(
 
     # ── Phase 3: chunked GPU dispatch — adaptive chunk size ─────────
     _t_phase3 = time.perf_counter()
-    # H100 NVL: 188GB HBM3, M1: 8GB unified — scale budget accordingly
+    # Dynamically detect GPU memory — use 80% to leave headroom
     if device.type == "cuda":
-        GPU_MEM_BUDGET = 188 * 1024 * 1024 * 1024  # 188 GB — saturate the H100 NVL
+        _total_vram = torch.cuda.get_device_properties(device).total_memory
+        GPU_MEM_BUDGET = int(_total_vram * 0.8)
     else:
         GPU_MEM_BUDGET = 512 * 1024 * 1024  # 512 MB
 
     gpu_results_sorted = np.empty(N, dtype=np.bool_)
 
+    _MAX_CHUNK_B = 50_000  # hard cap — prevents multi-GB CPU allocations
+
     start = 0
     while start < N:
         probe_end = min(start + chunk_size, N)
         chunk_S = max(int(s_max_s[start:probe_end].max()), 1)
-        max_B = max(GPU_MEM_BUDGET // (V * chunk_S * 4), 64)
+        chunk_P_est = int(pat_lengths_s[start:probe_end].max())
+        chunk_T_est = max(int(tgt_lengths_s[start:probe_end].max()), 1)
+        # Memory per step: sub_tables + sub_lens + patterns + targets (all int32)
+        bytes_per_step = (V * chunk_S + V + chunk_P_est + chunk_T_est) * 4
+        max_B = min(max(GPU_MEM_BUDGET // max(bytes_per_step, 1), 64), _MAX_CHUNK_B)
         B = min(probe_end - start, max_B)
         end = start + B
 
@@ -1006,22 +1013,32 @@ def _verify_encoded_on_gpu(
     # ── Phase 3: chunked GPU dispatch ────────────────────────────────
     _t_phase3 = time.perf_counter()
     if device.type == "cuda":
-        GPU_MEM_BUDGET = 99 * 1024 * 1024 * 1024
+        _total_vram = torch.cuda.get_device_properties(device).total_memory
+        GPU_MEM_BUDGET = int(_total_vram * 0.8)
     else:
         GPU_MEM_BUDGET = 512 * 1024 * 1024
+
+    _MAX_CHUNK_B = 50_000
 
     gpu_results_sorted = np.empty(N, dtype=np.bool_)
     start = 0
     while start < N:
         probe_end = min(start + chunk_size, N)
         chunk_S = max(int(s_max_s[start:probe_end].max()), 1)
-        max_B = max(GPU_MEM_BUDGET // (V * chunk_S * 4), 64)
+        chunk_P_est = int(pat_lengths_s[start:probe_end].max())
+        chunk_T_est = max(int(tgt_lengths_s[start:probe_end].max()), 1)
+        bytes_per_step = (V * chunk_S + V + chunk_P_est + chunk_T_est) * 4
+        max_B = min(max(GPU_MEM_BUDGET // max(bytes_per_step, 1), 64), _MAX_CHUNK_B)
         B = min(probe_end - start, max_B)
         end = start + B
 
         chunk_P = int(pat_lengths_s[start:end].max())
         chunk_T = max(int(tgt_lengths_s[start:end].max()), 1)
         chunk_S = max(int(s_max_s[start:end].max()), 1)
+
+        _st_mb = B * V * chunk_S * 4 / (1024 * 1024)
+        print(f"      chunk [{start}:{end}] B={B}, P={chunk_P}, T={chunk_T}, "
+              f"S={chunk_S}, st={_st_mb:.0f}MB", flush=True)
 
         st = np.zeros((B, V, chunk_S), dtype=np.int32)
         ident = np.arange(V, dtype=np.int32)
