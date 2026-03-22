@@ -13,6 +13,7 @@ FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Install Python 3.12 + pip + wget
 RUN apt-get update && apt-get install -y --no-install-recommends \
