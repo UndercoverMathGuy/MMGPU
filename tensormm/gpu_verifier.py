@@ -1768,74 +1768,90 @@ def _select_device() -> torch.device:
     return torch.device("cpu")
 
 
-def _verify_proofs_gpu_multi(
+def _verify_proofs_gpu_batched(
     plan: GlobalPlan,
-    num_gpus: int,
+    device: torch.device,
     verbose: bool = False,
 ) -> tuple[np.ndarray, float]:
-    """Run GPU verification split evenly across multiple GPUs using threads.
+    """Run GPU verification in sequential batches sized to fit available VRAM.
 
-    Splits the plan by proof index into num_gpus shards, runs each shard on
-    a separate GPU in parallel via Python threads (GIL is released during
-    CUDA ops), then concatenates results in order.
+    Instead of loading all proof nodes into VRAM at once, splits the plan into
+    batches where each batch's expr_buffer fits comfortably in free VRAM.
+    Each batch is: load → process → collect result → free → next.
+
+    Batch size is determined by:
+        free_vram * VRAM_BUDGET_FRACTION / (max_expr_len * 4 bytes per token)
+    giving the number of nodes per batch. We then find the proof boundary
+    nearest to that node count using graph_offsets.
     """
-    import threading
+    # MPS shares memory with the CPU/system — be conservative to avoid
+    # starving the OS. CUDA has dedicated VRAM so can use more.
+    VRAM_BUDGET_FRACTION = 0.45 if device.type == "mps" else 0.70
 
-    N = plan.num_proofs
     t0 = time.perf_counter()
+    N = plan.num_proofs
 
-    # Build split points by node count, not proof count.
-    # graph_offsets[pi] = cumulative nodes up to proof pi, so we find the
-    # proof index where the cumulative node count crosses each target fraction.
-    total_nodes = plan.total_nodes
-    split_points = [0]
-    for i in range(1, num_gpus):
-        target = total_nodes * i // num_gpus
-        # bisect to find first proof whose start offset >= target
-        pi = int(np.searchsorted(plan.graph_offsets, target, side='left'))
-        pi = max(split_points[-1] + 1, min(pi, N - (num_gpus - i)))
-        split_points.append(pi)
-    split_points.append(N)
+    # Compute how many nodes fit in VRAM per batch
+    if device.type == "cuda":
+        free_bytes, _ = torch.cuda.mem_get_info(device)
+    else:
+        free_bytes = 8 * 1024 ** 3  # 8 GB fallback for non-CUDA
 
-    # Split the plan into shards using absolute proof indices
-    shards: list[GlobalPlan] = []
-    remaining = plan
-    for i in range(num_gpus - 1):
-        chunk_size = split_points[i + 1] - split_points[i]
-        shard, remaining = _split_plan(remaining, chunk_size)
-        shards.append(shard)
-    shards.append(remaining)
+    bytes_per_node = plan.max_expr_len * 4  # int32 tokens
+    # Also account for expr_lengths, expr_hashes, node_failed (~13 bytes/node)
+    bytes_per_node += 13
+    nodes_per_batch = max(1, int(free_bytes * VRAM_BUDGET_FRACTION / bytes_per_node))
 
     if verbose:
-        for i, s in enumerate(shards):
-            print(f"    GPU {i}: {s.num_proofs} proofs, {s.total_nodes:,} nodes", flush=True)
+        free_gb = free_bytes / 1024**3
+        batch_gb = nodes_per_batch * bytes_per_node / 1024**3
+        print(
+            f"  Phase 3: {free_gb:.1f} GB free VRAM, "
+            f"~{batch_gb:.1f} GB per batch, "
+            f"{nodes_per_batch:,} nodes/batch",
+            flush=True,
+        )
 
-    results: list[np.ndarray | None] = [None] * num_gpus
-    errors: list[Exception | None] = [None] * num_gpus
+    # Build batch split points by node count using graph_offsets
+    split_points: list[int] = [0]
+    while split_points[-1] < N:
+        prev = split_points[-1]
+        target_nodes = int(plan.graph_offsets[prev]) + nodes_per_batch
+        # Find first proof index whose start offset >= target_nodes
+        pi = int(np.searchsorted(plan.graph_offsets, target_nodes, side='left'))
+        pi = min(pi, N)
+        if pi <= prev:
+            pi = prev + 1  # always advance at least one proof
+        split_points.append(pi)
 
-    def _run_shard(idx: int, shard: GlobalPlan) -> None:
-        dev = torch.device(f"cuda:{idx}")
-        try:
-            warmup_cuda(dev)
-            result, _ = verify_proofs_gpu(shard, dev, verbose=verbose)
-            results[idx] = result
-        except Exception as e:
-            errors[idx] = e
+    num_batches = len(split_points) - 1
+    if verbose:
+        print(f"  Phase 3: {N} proofs → {num_batches} sequential batch(es)", flush=True)
 
-    threads = [
-        threading.Thread(target=_run_shard, args=(i, shards[i]), daemon=True)
-        for i in range(num_gpus)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    all_results: list[np.ndarray] = []
+    remaining = plan
+    for batch_idx in range(num_batches):
+        if batch_idx < num_batches - 1:
+            chunk_size = split_points[batch_idx + 1] - split_points[batch_idx]
+            shard, remaining = _split_plan(remaining, chunk_size)
+        else:
+            shard = remaining
 
-    for i, err in enumerate(errors):
-        if err is not None:
-            raise RuntimeError(f"GPU {i} shard failed: {err}") from err
+        if verbose:
+            print(
+                f"    Batch {batch_idx + 1}/{num_batches}: "
+                f"{shard.num_proofs} proofs, {shard.total_nodes:,} nodes",
+                flush=True,
+            )
 
-    proof_passed = np.concatenate([r for r in results if r is not None])
+        result, _ = verify_proofs_gpu(shard, device, verbose=verbose)
+        all_results.append(result)
+
+        # Explicitly free GPU memory before next batch
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    proof_passed = np.concatenate(all_results)
     t_gpu = time.perf_counter() - t0
     return proof_passed, t_gpu
 
@@ -1924,13 +1940,7 @@ def verify_database(
         )
 
     # ── Phase 3: GPU execution ───────────────────────────────────
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
-    if num_gpus >= 2 and plan.num_proofs >= 2:
-        if verbose:
-            print(f"  Phase 3: distributing across {num_gpus} GPUs...", flush=True)
-        proof_passed, t_gpu = _verify_proofs_gpu_multi(plan, num_gpus, verbose=verbose)
-    else:
-        proof_passed, t_gpu = verify_proofs_gpu(plan, device, verbose=verbose)
+    proof_passed, t_gpu = _verify_proofs_gpu_batched(plan, device, verbose=verbose)
     if verbose:
         n_pass = int(proof_passed.sum())
         print(
