@@ -819,10 +819,19 @@ def _apply_substitution_compact(
                 torch.empty(0, dtype=torch.int32, device=device))
 
     # STEP 1: Match pattern tokens against variable IDs.
-    # [B, P_max, 1] == [B, 1, max_fhyps] → [B, P_max, max_fhyps]
-    is_match = (patterns.unsqueeze(2).long() == var_ids.unsqueeze(1)) & var_valid.unsqueeze(1)
-    has_var = is_match.any(dim=2)              # [B, P_max]
-    var_idx = is_match.long().argmax(dim=2)    # [B, P_max] — which fhyp (valid only where has_var)
+    # Avoid materializing [B, P_max, max_fhyps] (can be 16+ GB when B=cB*E).
+    # Instead loop over max_fhyps (≤20) and accumulate [B, P_max] tensors.
+    pats_long = patterns.long()  # [B, P_max]
+    has_var = torch.zeros(B, P_max, dtype=torch.bool, device=device)
+    var_idx = torch.zeros(B, P_max, dtype=torch.long, device=device)
+    for f in range(max_fhyps):
+        if not var_valid[:, f].any():
+            continue
+        match_f = (pats_long == var_ids[:, f].unsqueeze(1)) & var_valid[:, f].unsqueeze(1)  # [B, P_max]
+        # First matching fhyp wins (same semantics as argmax on first True)
+        new_match = match_f & ~has_var
+        var_idx = torch.where(new_match, torch.full_like(var_idx, f), var_idx)
+        has_var = has_var | match_f
 
     # STEP 2: Compute per-position replacement lengths.
     b_range_P = torch.arange(B, device=device).unsqueeze(1).expand(B, P_max)
