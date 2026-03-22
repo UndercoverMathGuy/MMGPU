@@ -433,12 +433,16 @@ def pack_levels(
         print(f"  Phase 2: label_info done, assigning global indices...", flush=True)
 
     # ── Assign global buffer indices ─────────────────────────────────
+    # Use a simple offset array instead of a dict.  Nodes within each graph
+    # have contiguous step indices (0, 1, 2, …), so:
+    #     global_idx = graph_offsets[pi] + node.step_idx
+    # This replaces a Python dict with ~200 bytes/entry overhead with a
+    # compact numpy int64 array (8 bytes/entry).
+    graph_offsets = np.empty(len(graphs), dtype=np.int64)
     total_nodes = 0
-    global_idx_map: dict[tuple[int, int], int] = {}
     for pi, g in enumerate(graphs):
-        for node in g.nodes:
-            global_idx_map[(pi, node.step_idx)] = total_nodes
-            total_nodes += 1
+        graph_offsets[pi] = total_nodes
+        total_nodes += len(g.nodes)
     if verbose:
         print(f"  Phase 2: {total_nodes:,} total nodes, computing max_expr_len...", flush=True)
 
@@ -465,13 +469,14 @@ def pack_levels(
     # tokens (mulsasslem1/2). Giving 28% headroom keeps expr_buffer at
     # 6M × 1024 × 4 = ~24 GB on set.mm, vs 98 GB at 4096 or 278 GB at 11548.
     # Theorems with conclusions > 1024 use rolling-hash comparison instead.
+    #
+    # Phase 1 already computes max_push_expr_len per graph, so we reuse that
+    # instead of re-scanning every node (O(total_nodes) → O(num_graphs)).
     _EXPR_BUF_CAP = 1024
     max_expr_len = 512
     for g in graphs:
-        for node in g.nodes:
-            if node.expression is not None:
-                if len(node.expression) > max_expr_len:
-                    max_expr_len = len(node.expression)
+        if g.max_push_expr_len > max_expr_len:
+            max_expr_len = g.max_push_expr_len
         if len(g.expected_conclusion) > max_expr_len:
             max_expr_len = len(g.expected_conclusion)
     max_expr_len = min(max_expr_len, _EXPR_BUF_CAP)
@@ -489,6 +494,7 @@ def pack_levels(
                 used_labels.append(node.label)
 
     A = len(used_labels)
+    del seen_labels  # no longer needed
     label_to_idx: dict[str, int] = {lbl: i for i, lbl in enumerate(used_labels)}
 
     # Compute table dimensions
@@ -558,6 +564,10 @@ def pack_levels(
         ehyp_pattern_lengths=tbl_ehyp_pattern_lengths,
         ehyp_count=tbl_ehyp_count,
     )
+    # Free raw table arrays — now owned by assertion_table
+    del tbl_pattern_toks, tbl_pattern_lengths
+    del tbl_fhyp_var_ids, tbl_fhyp_count
+    del tbl_ehyp_patterns, tbl_ehyp_pattern_lengths, tbl_ehyp_count
 
     # ── Collect nodes by level ───────────────────────────────────────
     push_nodes: list[tuple[int, ProofNode]] = []
@@ -580,31 +590,33 @@ def pack_levels(
     sorted_levels = sorted(assertion_nodes_by_level.keys())
     if verbose:
         print(f"  Phase 2: packing {len(push_nodes):,} push nodes, {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
-    # Single pass: encode all push expressions and collect global indices / lengths.
-    # Avoid per-row numpy slice assignment (O(n) Python overhead for 2.4M rows)
-    # by building a flat int32 array and filling via scatter.
-    push_encoded: list[list[int]] = []
-    push_global_indices_list: list[int] = []
+    # Two-pass approach: first pass computes max_push_width and collects
+    # metadata, second pass fills a pre-allocated numpy array directly.
+    # This avoids building millions of temporary Python lists (the old code
+    # created a list-of-lists then padded each one with [0]*… comprehension).
+    num_push = len(push_nodes)
+    push_global_indices = np.empty(num_push, dtype=np.int32)
+    push_expr_lengths   = np.empty(num_push, dtype=np.int32)
+
+    # First pass: encode, record lengths, find max_push_width.
+    push_encoded: list[list[int]] = [None] * num_push  # type: ignore[list-item]
     max_push_width = 1
-    for pi, node in push_nodes:
+    for i, (pi, node) in enumerate(push_nodes):
         assert node.expression is not None
         enc = _enc(node.expression)
-        push_encoded.append(enc)
-        push_global_indices_list.append(global_idx_map[(pi, node.step_idx)])
+        push_encoded[i] = enc
+        push_global_indices[i] = int(graph_offsets[pi]) + node.step_idx
+        push_expr_lengths[i] = len(enc)
         if len(enc) > max_push_width:
             max_push_width = len(enc)
 
-    push_global_indices = np.array(push_global_indices_list, dtype=np.int32)
-    push_expr_lengths   = np.array([len(e) for e in push_encoded], dtype=np.int32)
-
-    # Build push_expressions in one numpy call: pad each encoded list to
-    # max_push_width with zeros, then stack. numpy.array() on a list of
-    # equal-length lists is a single C-level allocation — no Python loop
-    # over 2.4M rows.
-    push_expressions = np.array(
-        [enc + [0] * (max_push_width - len(enc)) for enc in push_encoded],
-        dtype=np.int32,
-    )
+    # Second pass: fill pre-allocated numpy array row by row.
+    # numpy zeros + row slice assignment is cheaper than building a
+    # padded list-of-lists and calling np.array() on it.
+    push_expressions = np.zeros((num_push, max_push_width), dtype=np.int32)
+    for i, enc in enumerate(push_encoded):
+        push_expressions[i, :len(enc)] = enc
+    del push_encoded  # free the temporary list
 
     # ── Pack assertion levels ────────────────────────────────────────
 
@@ -644,7 +656,7 @@ def pack_levels(
             n_e = len(a.essential_hyps)
             input_counts[b] = n_f + n_e
             for k, si in enumerate(node.input_steps):
-                input_global_indices[b, k] = global_idx_map[(pi, si)]
+                input_global_indices[b, k] = int(graph_offsets[pi]) + si
 
             for f_idx in range(n_f):
                 fhyp_input_positions[b, f_idx] = f_idx
@@ -652,7 +664,7 @@ def pack_levels(
             for e_idx in range(n_e):
                 ehyp_input_positions[b, e_idx] = n_f + e_idx
 
-            output_global_indices[b] = global_idx_map[(pi, node.step_idx)]
+            output_global_indices[b] = int(graph_offsets[pi]) + node.step_idx
 
         return AssertionLevelBatch(
             level=lvl,
@@ -672,24 +684,34 @@ def pack_levels(
     if verbose:
         print(f"  Phase 2: packing {len(sorted_levels)} levels...", flush=True)
     assertion_batches = [_pack_one_level(lvl) for lvl in sorted_levels]
+    # Free node collections — now packed into assertion_batches / push arrays
+    del push_nodes, assertion_nodes_by_level, sorted_levels
 
     # ── Final check data ─────────────────────────────────────────────
+    # Cap the stored conclusion width to max_expr_len: conclusions longer
+    # than the expr_buffer use rolling-hash comparison (not token comparison),
+    # so storing their full token sequences wastes memory. For set.mm this
+    # avoids a num_proofs × 11548 array (1.3 GB) in favour of
+    # num_proofs × 1024 (120 MB).
     num_proofs = len(graphs)
-    max_concl_len = max((len(g.expected_conclusion) for g in graphs), default=1)
-    final_node_indices         = np.zeros(num_proofs,               dtype=np.int32)
-    expected_conclusions       = np.zeros((num_proofs, max_concl_len), dtype=np.int32)
-    conclusion_lengths         = np.zeros(num_proofs,               dtype=np.int32)
-    expected_conclusion_hashes = np.zeros(num_proofs,               dtype=np.int64)
+    max_concl_stored = max_expr_len
+    final_node_indices         = np.zeros(num_proofs,                    dtype=np.int32)
+    expected_conclusions       = np.zeros((num_proofs, max_concl_stored), dtype=np.int32)
+    conclusion_lengths         = np.zeros(num_proofs,                    dtype=np.int32)
+    expected_conclusion_hashes = np.zeros(num_proofs,                    dtype=np.int64)
     proof_theorem_labels: list[str] = []
 
     for pi, g in enumerate(graphs):
         proof_theorem_labels.append(g.theorem_label)
         last_node = g.nodes[-1]
-        final_node_indices[pi] = global_idx_map[(pi, last_node.step_idx)]
+        final_node_indices[pi] = int(graph_offsets[pi]) + last_node.step_idx
         enc = np.array(_enc(g.expected_conclusion), dtype=np.int32)
         conclusion_lengths[pi] = len(enc)
-        expected_conclusions[pi, :len(enc)] = enc
+        store_len = min(len(enc), max_concl_stored)
+        expected_conclusions[pi, :store_len] = enc[:store_len]
         expected_conclusion_hashes[pi] = _poly_hash_np(enc)
+    # Free encoding cache and label_info — no longer needed after this point
+    del _enc_cache, label_info
 
     return GlobalPlan(
         total_nodes=total_nodes,
