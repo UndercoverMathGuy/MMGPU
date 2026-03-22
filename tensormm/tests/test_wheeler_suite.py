@@ -1,11 +1,11 @@
 """Wheeler metamath-test suite — GPU verifier correctness tests.
 
 Runs the david-a-wheeler/metamath-test suite against our full pipeline:
-  parse → CPU replay → GPU substitution verification.
+  parse → GPU topological-level verification.
 
 Test expectations come directly from the upstream run-testsuite script.
 "bad" files should fail during either parsing or CPU proof replay.
-"good" files must pass parsing, CPU replay, AND GPU verification.
+"good" files must pass parsing AND GPU verification.
 
 See: https://github.com/david-a-wheeler/metamath-test
 """
@@ -16,18 +16,10 @@ import os
 import time
 
 import pytest
-import torch
 
 from tensormm.cpu_verifier import CPUVerifier
+from tensormm.gpu_verifier import verify_database
 from tensormm.parser import ParsedDatabase, parse_mm_file
-from tensormm.tokenizer import Tokenizer
-from tensormm.database import MetamathDatabase
-from tensormm.tests.test_full_correctness import (
-    _collect_all_steps,
-    _get_gpu_device,
-    _gpu_backend_name,
-    _verify_steps_batched_on_gpu,
-)
 
 
 WHEELER_DIR = os.path.join(
@@ -64,37 +56,18 @@ def _parse_and_verify_cpu(path: str) -> tuple[bool, str, ParsedDatabase | None]:
 
 
 def _verify_gpu(parsed: ParsedDatabase) -> tuple[int, int, str]:
-    """Run GPU substitution verification on all theorems.
+    """Run true GPU verification on all theorems.
 
-    Returns (total_steps, n_failures, detail_msg).
+    Returns (n_theorems, n_failures, detail_msg).
     """
-    device = _get_gpu_device()
-
     theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
     if not theorems:
         return 0, 0, "no theorems"
 
-    tok = Tokenizer()
-    for c in parsed.constants:
-        tok.encode_symbol(c)
-    for v in parsed.variables:
-        tok.encode_symbol(v)
-    is_variable = torch.zeros(tok.vocab_size(), dtype=torch.bool)
-    for v in parsed.variables:
-        is_variable[tok.encode_symbol(v)] = True
-
-    all_steps, replay_errors = _collect_all_steps(parsed, theorems)
-    if replay_errors:
-        return 0, len(replay_errors), f"replay errors: {replay_errors[0]}"
-
-    if not all_steps:
-        return 0, 0, "no assertion steps extracted"
-
-    gpu_failures, stats = _verify_steps_batched_on_gpu(
-        all_steps, tok, is_variable, device
-    )
-    n = stats.get("steps_verified", 0)
-    return n, len(gpu_failures), f"{n} steps, {len(gpu_failures)} GPU failures"
+    results = verify_database(parsed, theorem_labels=theorems)
+    n_fail = sum(1 for v in results.values() if not v)
+    n_pass = len(results) - n_fail
+    return len(results), n_fail, f"{n_pass}/{len(results)} theorems pass"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -147,14 +120,14 @@ class TestWheelerPass:
         "hol.mm",
     ])
     def test_gpu_pass(self, filename: str) -> None:
-        """GPU verifier must accept all assertion steps in this file."""
+        """GPU verifier must accept all theorems in this file."""
         path = _skip_if_missing(filename)
         parsed = parse_mm_file(path)
         theorems = [k for k, v in parsed.assertions.items() if v.type == "theorem"]
         if not theorems:
             pytest.skip(f"{filename} has no theorems")
 
-        n_steps, n_fail, detail = _verify_gpu(parsed)
+        n_total, n_fail, detail = _verify_gpu(parsed)
         print(f"  [{filename}] {detail}")
         assert n_fail == 0, f"{filename} GPU: {detail}"
         gc.collect()
@@ -195,7 +168,7 @@ class TestWheelerLargeGPU:
         "nf.mm",
     ])
     def test_gpu_large(self, filename: str) -> None:
-        """GPU verifier must pass all steps in larger .mm files."""
+        """GPU verifier must pass all theorems in larger .mm files."""
         path = _skip_if_missing(filename)
         t0 = time.perf_counter()
         parsed = parse_mm_file(path)
@@ -206,7 +179,7 @@ class TestWheelerLargeGPU:
             pytest.skip(f"{filename} has no theorems")
 
         print(f"\n  [{filename}] Parsed in {t_parse:.1f}s, {len(theorems)} theorems")
-        n_steps, n_fail, detail = _verify_gpu(parsed)
+        n_total, n_fail, detail = _verify_gpu(parsed)
         print(f"  [{filename}] {detail}")
         assert n_fail == 0, f"{filename} GPU: {detail}"
         gc.collect()

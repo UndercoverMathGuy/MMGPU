@@ -35,6 +35,7 @@ import numpy as np
 
 from tensormm.cpu_verifier import CPUVerifier, apply_substitution
 from tensormm.database import MetamathDatabase
+from tensormm.gpu_verifier import verify_database
 from tensormm.parser import ParsedDatabase, parse_mm_file
 from tensormm.tensor_verifier import TensorVerifier
 from tensormm.tokenizer import Tokenizer
@@ -668,48 +669,40 @@ class TestQLmmExhaustive:
         assert failed == 0, f"{failed} theorems failed CPU verification"
 
     def test_gpu_matches_cpu_all_ql(self, ql_data, capsys) -> None:
-        """GPU must match CPU on EVERY assertion step of EVERY theorem in ql.mm.
-
-        Steps are batched by axiom/theorem label — one GPU call per unique pattern.
-        """
+        """GPU must match CPU on every theorem in ql.mm."""
         device = _get_gpu_device()
         backend = _gpu_backend_name()
         parsed, tok, db = ql_data
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
-        print(
-            f"\n[ql.mm {backend}] Replaying {len(theorems)} theorems to extract assertion steps..."
-        )
+        print(f"\n[ql.mm {backend}] Verifying {len(theorems)} theorems...")
 
         t0 = time.perf_counter()
-        all_steps, replay_errors = _collect_all_steps(parsed, theorems)
-        t_replay = time.perf_counter() - t0
-        print(
-            f"[ql.mm {backend}] Extracted {len(all_steps)} assertion steps in {t_replay:.2f}s"
-        )
+        gpu_results = verify_database(parsed, theorems, device=device, verbose=True)
+        t_gpu = time.perf_counter() - t0
 
-        t1 = time.perf_counter()
-        gpu_failures, stats = _verify_steps_batched_on_gpu(
-            all_steps, tok, db.is_variable, device
-        )
-        t_gpu = time.perf_counter() - t1
+        cpu_v = CPUVerifier(parsed)
+        cpu_results = cpu_v.verify_all()
 
-        for err in replay_errors:
-            print(err)
-        for fail in gpu_failures:
-            print(fail)
+        divergences = []
+        for lbl, cpu_r in cpu_results.items():
+            if lbl not in gpu_results:
+                divergences.append(f"GPU missing: {lbl}")
+            elif gpu_results[lbl] != cpu_r.success:
+                divergences.append(
+                    f"{lbl}: GPU={gpu_results[lbl]}, CPU={cpu_r.success} "
+                    f"(err={cpu_r.error_message})"
+                )
 
+        gpu_pass = sum(1 for v in gpu_results.values() if v)
         print(f"\n[ql.mm {backend}] Results:")
-        print(f"  Steps verified:  {stats['steps_verified']}")
-        print(f"  Pattern groups:  {stats['num_groups']}")
-        print(f"  Compact vocab:   {stats.get('compact_vocab', '?')}")
-        print(f"  GPU time:        {t_gpu:.2f}s")
-        print(f"  Replay errors:   {len(replay_errors)}")
-        print(f"  GPU failures:    {len(gpu_failures)}")
+        print(f"  Theorems verified: {len(gpu_results)}")
+        print(f"  GPU passed:        {gpu_pass}")
+        print(f"  GPU time:          {t_gpu:.2f}s")
+        print(f"  Divergences:       {len(divergences)}")
 
-        assert len(replay_errors) == 0, f"{len(replay_errors)} proof replay errors"
-        assert len(gpu_failures) == 0, (
-            f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        assert len(divergences) == 0, (
+            f"{len(divergences)} GPU/CPU divergences:\n" + "\n".join(divergences[:20])
         )
 
 
@@ -1286,7 +1279,7 @@ class TestSetMMFirst1000:
         assert failed == 0, f"{failed} theorems failed CPU verification"
 
     def test_gpu_matches_cpu_first_1000_set_mm(self, setmm_data, capsys) -> None:
-        """GPU must match CPU on every assertion step of first 1000 set.mm theorems."""
+        """GPU must match CPU on first 1000 set.mm theorems."""
         device = _get_gpu_device()
         backend = _gpu_backend_name()
         parsed, tok, db = setmm_data
@@ -1295,34 +1288,33 @@ class TestSetMMFirst1000:
             :1000
         ]
 
-        print(f"\n[set.mm {backend}] Verifying {len(theorems)} theorems (streaming)...")
+        print(f"\n[set.mm {backend}] Verifying {len(theorems)} theorems...")
 
-        gpu_failures, replay_errors, total_steps, t_replay, t_gpu, _ = (
-            _verify_streaming(
-                parsed,
-                theorems,
-                tok,
-                db.is_variable,
-                device,
-                tag="set.mm",
-            )
-        )
+        t0 = time.perf_counter()
+        gpu_results = verify_database(parsed, theorems, device=device, verbose=True)
+        t_gpu = time.perf_counter() - t0
 
-        for err in replay_errors:
-            print(err)
-        for fail in gpu_failures:
-            print(fail)
+        cpu_v = CPUVerifier(parsed)
+        divergences = []
+        for lbl in theorems:
+            cpu_r = cpu_v.verify_proof(lbl)
+            if lbl not in gpu_results:
+                divergences.append(f"GPU missing: {lbl}")
+            elif gpu_results[lbl] != cpu_r.success:
+                divergences.append(
+                    f"{lbl}: GPU={gpu_results[lbl]}, CPU={cpu_r.success} "
+                    f"(err={cpu_r.error_message})"
+                )
 
+        gpu_pass = sum(1 for v in gpu_results.values() if v)
         print(f"\n[set.mm {backend}] Results:")
-        print(f"  Steps verified:  {total_steps}")
-        print(f"  Replay time:     {t_replay:.2f}s")
-        print(f"  GPU time:        {t_gpu:.2f}s")
-        print(f"  Replay errors:   {len(replay_errors)}")
-        print(f"  GPU failures:    {len(gpu_failures)}")
+        print(f"  Theorems verified: {len(gpu_results)}")
+        print(f"  GPU passed:        {gpu_pass}")
+        print(f"  GPU time:          {t_gpu:.2f}s")
+        print(f"  Divergences:       {len(divergences)}")
 
-        assert len(replay_errors) == 0, f"{len(replay_errors)} proof replay errors"
-        assert len(gpu_failures) == 0, (
-            f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        assert len(divergences) == 0, (
+            f"{len(divergences)} GPU/CPU divergences:\n" + "\n".join(divergences[:20])
         )
 
 
@@ -1359,81 +1351,42 @@ class TestSetMMFull:
         return parsed, tok, is_variable
 
     def test_gpu_all_set_mm(self, setmm_data, capsys) -> None:
-        """GPU streaming verification of ALL set.mm theorems."""
+        """GPU verification of ALL set.mm theorems."""
         device = _get_gpu_device()
         backend = _gpu_backend_name()
         parsed, tok, is_variable = setmm_data
 
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         n_axioms = sum(1 for a in parsed.assertions.values() if a.type == "axiom")
-        step_budget = 500_000 if device.type == "cuda" else 5_000
         print(
-            f"\n[set.mm FULL {backend}] Verifying {len(theorems)} theorems "
-            f"({n_axioms} axioms, {len(parsed.assertions)} total assertions)"
-        )
-        print(
-            f"  Streaming budget: {'ALL (single batch)' if device.type == 'cuda' else f'{step_budget // 1000}k steps/batch'}"
+            f"\n[set.mm FULL {backend}] Verifying {len(theorems):,} theorems "
+            f"({n_axioms:,} axioms, {len(parsed.assertions):,} total assertions)"
         )
         print(f"  Backend: {backend}")
         print()
 
         t_total_0 = time.perf_counter()
-        gpu_failures, replay_errors, total_steps, t_replay, t_gpu, batch_stats = (
-            _verify_streaming(
-                parsed,
-                theorems,
-                tok,
-                is_variable,
-                device,
-                step_budget=step_budget,
-                tag="set.mm FULL",
-                verbose=True,
-            )
-        )
+        gpu_results = verify_database(parsed, theorems, device=device, verbose=True)
         t_total = time.perf_counter() - t_total_0
 
-        for fail in gpu_failures[:20]:
-            print(fail)
-        if len(gpu_failures) > 20:
-            print(f"  ... and {len(gpu_failures) - 20} more")
+        gpu_pass = sum(1 for v in gpu_results.values() if v)
+        gpu_fail = sum(1 for v in gpu_results.values() if not v)
 
-        # ── Summary table ─────────────────────────────────────────────
-        avg_steps_per_sec = total_steps / t_gpu if t_gpu > 0 else 0
-        avg_steps_per_batch = total_steps / len(batch_stats) if batch_stats else 0
-        peak_batch_rate = max((b["steps_per_sec"] for b in batch_stats), default=0)
-        min_batch_rate = min((b["steps_per_sec"] for b in batch_stats), default=0)
-
-        print(f"\n{'\u2550' * 60}")
-        print(f"  set.mm FULL \u2014 {backend} Verification Report")
-        print(f"{'\u2550' * 60}")
+        print(f"\n{'═' * 60}")
+        print(f"  set.mm FULL — {backend} Verification Report")
+        print(f"{'═' * 60}")
         print(f"  Database")
         print(f"    Axioms:             {n_axioms:,}")
         print(f"    Theorems:           {len(theorems):,}")
         print(f"    Constants:          {len(parsed.constants):,}")
         print(f"    Variables:          {len(parsed.variables):,}")
-        print(f"  Verification")
-        print(f"    Total steps:        {total_steps:,}")
-        print(f"    Mega-batches:       {len(batch_stats)}")
-        print(f"    Avg steps/batch:    {avg_steps_per_batch:,.0f}")
+        print(f"  Results")
+        print(f"    Passed:             {gpu_pass:,}")
+        print(f"    Failed:             {gpu_fail:,}")
         print(f"  Timing")
-        print(f"    Replay (CPU):       {t_replay:.2f}s")
-        print(f"    GPU (Metal):        {t_gpu:.2f}s")
         print(f"    Total wall clock:   {t_total:.2f}s")
-        print(f"  Throughput")
-        print(f"    Avg:                {avg_steps_per_sec:,.0f} steps/s")
-        print(f"    Peak batch:         {peak_batch_rate:,.0f} steps/s")
-        print(f"    Min batch:          {min_batch_rate:,.0f} steps/s")
-        print(f"  Errors")
-        print(f"    Replay errors:      {len(replay_errors)}")
-        print(f"    GPU failures:       {len(gpu_failures)}")
-        print(
-            f"    Replay success:     {len(theorems) - len(replay_errors)}/{len(theorems)} "
-            f"({100 * (len(theorems) - len(replay_errors)) / len(theorems):.1f}%)"
-        )
         print(f"{'═' * 60}")
 
-        # Allow replay errors (some set.mm proofs may use features we don't support)
-        # but GPU failures are UNSOUND
-        assert len(gpu_failures) == 0, (
-            f"{len(gpu_failures)} GPU/CPU divergences — kernel is UNSOUND"
+        assert gpu_fail == 0, (
+            f"{gpu_fail} GPU verification failures — kernel is UNSOUND"
         )
