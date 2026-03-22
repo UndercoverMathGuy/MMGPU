@@ -395,19 +395,11 @@ def pack_levels(
     graphs: list[ProofGraph],
     parsed: ParsedDatabase,
     tokenizer: Tokenizer,
+    verbose: bool = False,
 ) -> GlobalPlan:
-    """Pack all proof graphs into level-indexed GPU-ready tensors.
-
-    Optimised for many-core machines (Xeon/EPYC):
-    - Token encoding is done once per unique expression into a shared cache
-      so repeated axioms (ax-mp appears in thousands of proofs) are encoded
-      exactly once rather than once per node.
-    - Per-level array filling is parallelised across a ThreadPoolExecutor.
-      numpy array writes release the GIL so threads genuinely run in parallel
-      across cores without fork overhead.
-    """
-    from concurrent.futures import ThreadPoolExecutor
-
+    """Pack all proof graphs into level-indexed GPU-ready tensors."""
+    if verbose:
+        print(f"  Phase 2: building label_info...", flush=True)
     label_info = _build_label_info(parsed)
 
     # ── Assign global buffer indices ─────────────────────────────────
@@ -564,12 +556,9 @@ def pack_levels(
             output_global_indices=output_global_indices,
         )
 
-    pack_workers = min(os.cpu_count() or 1, len(sorted_levels))
-    if pack_workers > 1:
-        with ThreadPoolExecutor(max_workers=pack_workers) as tex:
-            assertion_batches = list(tex.map(_pack_one_level, sorted_levels))
-    else:
-        assertion_batches = [_pack_one_level(lvl) for lvl in sorted_levels]
+    if verbose:
+        print(f"  Phase 2: packing {len(sorted_levels)} levels...", flush=True)
+    assertion_batches = [_pack_one_level(lvl) for lvl in sorted_levels]
 
     # ── Final check data ─────────────────────────────────────────────
     num_proofs = len(graphs)
@@ -1484,7 +1473,7 @@ def verify_database(
     for v in parsed.variables:
         tokenizer.encode_symbol(v)
 
-    plan = pack_levels(graphs, parsed, tokenizer)
+    plan = pack_levels(graphs, parsed, tokenizer, verbose=verbose)
     t_pack = time.perf_counter() - t1
     if verbose:
         print(
