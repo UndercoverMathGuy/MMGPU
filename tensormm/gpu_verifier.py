@@ -580,26 +580,31 @@ def pack_levels(
     sorted_levels = sorted(assertion_nodes_by_level.keys())
     if verbose:
         print(f"  Phase 2: packing {len(push_nodes):,} push nodes, {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
-    n_push = len(push_nodes)
-
-    # First pass: encode all push expressions and find actual max width
+    # Single pass: encode all push expressions and collect global indices / lengths.
+    # Avoid per-row numpy slice assignment (O(n) Python overhead for 2.4M rows)
+    # by building a flat int32 array and filling via scatter.
     push_encoded: list[list[int]] = []
+    push_global_indices_list: list[int] = []
     max_push_width = 1
-    for _, node in push_nodes:
+    for pi, node in push_nodes:
         assert node.expression is not None
         enc = _enc(node.expression)
         push_encoded.append(enc)
+        push_global_indices_list.append(global_idx_map[(pi, node.step_idx)])
         if len(enc) > max_push_width:
             max_push_width = len(enc)
 
-    push_global_indices = np.zeros(n_push, dtype=np.int32)
-    push_expressions    = np.zeros((n_push, max_push_width), dtype=np.int32)
-    push_expr_lengths   = np.zeros(n_push, dtype=np.int32)
+    push_global_indices = np.array(push_global_indices_list, dtype=np.int32)
+    push_expr_lengths   = np.array([len(e) for e in push_encoded], dtype=np.int32)
 
-    for i, ((pi, node), encoded) in enumerate(zip(push_nodes, push_encoded)):
-        push_global_indices[i] = global_idx_map[(pi, node.step_idx)]
-        push_expr_lengths[i]   = len(encoded)
-        push_expressions[i, :len(encoded)] = encoded
+    # Build push_expressions in one numpy call: pad each encoded list to
+    # max_push_width with zeros, then stack. numpy.array() on a list of
+    # equal-length lists is a single C-level allocation — no Python loop
+    # over 2.4M rows.
+    push_expressions = np.array(
+        [enc + [0] * (max_push_width - len(enc)) for enc in push_encoded],
+        dtype=np.int32,
+    )
 
     # ── Pack assertion levels ────────────────────────────────────────
 
