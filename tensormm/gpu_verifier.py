@@ -321,47 +321,71 @@ def build_all_proof_graphs(
 
 
 @dataclass
+class AssertionTable:
+    """Deduplicated lookup table of all unique assertions used in a plan.
+
+    Instead of repeating pattern/ehyp data once per proof node (which
+    creates multi-GB arrays when B is large), each node stores a single
+    integer index into this table.  For set.mm, ~37k unique assertions
+    replace ~10M repeated rows.
+
+    Shapes:
+        pattern_toks:        [A, P_max]           int32
+        pattern_lengths:     [A]                  int32
+        fhyp_var_ids:        [A, max_fhyps]       int32
+        fhyp_count:          [A]                  int32
+        ehyp_patterns:       [A, max_ehyps, E]    int32
+        ehyp_pattern_lengths:[A, max_ehyps]       int32
+        ehyp_count:          [A]                  int32
+    where A = number of unique assertions.
+    """
+    assertion_labels: list[str]           # [A] label for each row
+    label_to_idx: dict[str, int]          # label -> row index
+
+    pattern_toks: np.ndarray              # [A, P_max]
+    pattern_lengths: np.ndarray           # [A]
+
+    fhyp_var_ids: np.ndarray              # [A, max_fhyps]
+    fhyp_count: np.ndarray               # [A]
+
+    ehyp_patterns: np.ndarray            # [A, max_ehyps, E_max]
+    ehyp_pattern_lengths: np.ndarray     # [A, max_ehyps]
+    ehyp_count: np.ndarray               # [A]
+
+
+@dataclass
 class AssertionLevelBatch:
     """Packed tensor data for assertion nodes at one or more topological levels.
 
-    When multiple consecutive sparse levels are coalesced into one batch,
-    `node_levels` tracks the per-node level so `_execute_level` can process
-    sub-groups in topological order within the single kernel dispatch.
-    `level` holds the minimum level in the batch; `max_level` holds the max.
+    Pattern/ehyp data is NOT stored here — instead each node carries an
+    `assertion_idx` into the shared AssertionTable.  This reduces memory
+    from O(B × pat_len) to O(B) for the per-batch arrays.
     """
-    level: int       # min level in this batch
-    max_level: int   # max level in this batch (== level for single-level batches)
+    level: int
+    max_level: int
     count: int  # B
 
-    # Per-node level (shape [B] int32) — all equal to `level` for single-level
-    # batches; varies for coalesced multi-level batches.
-    node_levels: np.ndarray
+    node_levels: np.ndarray              # [B] int32
 
-    # Which assertion is being applied (for $d post-check)
+    # Which assertion is being applied (for $d post-check / error reporting)
     assertion_labels: list[str]
-    # Map from batch index to (theorem_label, node_step_idx) for error reporting
     theorem_labels: list[str]
 
-    pattern_toks: np.ndarray     # [B, P_max] int32
-    pattern_lengths: np.ndarray  # [B] int32
+    # Index into AssertionTable for each node
+    assertion_idx: np.ndarray            # [B] int32
 
-    # Input mapping: which expr_buffer slots to read
-    input_global_indices: np.ndarray  # [B, max_inputs] int32 — -1 for padding
-    input_counts: np.ndarray          # [B] int32
+    # Per-node input mapping
+    input_global_indices: np.ndarray     # [B, max_inputs] int32 — -1 for padding
+    input_counts: np.ndarray             # [B] int32
 
-    # Floating hyp metadata
-    fhyp_input_positions: np.ndarray  # [B, max_fhyps] int32
-    fhyp_var_ids: np.ndarray          # [B, max_fhyps] int32
-    fhyp_count: np.ndarray            # [B] int32
+    # Floating hyp input positions (which input slot holds each $f value)
+    fhyp_input_positions: np.ndarray     # [B, max_fhyps] int32
 
-    # Essential hyp metadata
-    ehyp_input_positions: np.ndarray    # [B, max_ehyps] int32
-    ehyp_patterns: np.ndarray           # [B, max_ehyps, max_ehyp_len] int32
-    ehyp_pattern_lengths: np.ndarray    # [B, max_ehyps] int32
-    ehyp_count: np.ndarray              # [B] int32
+    # Essential hyp input positions (which input slot holds each $e value)
+    ehyp_input_positions: np.ndarray     # [B, max_ehyps] int32
 
     # Output: where to write in expr_buffer
-    output_global_indices: np.ndarray   # [B] int32
+    output_global_indices: np.ndarray    # [B] int32
 
 
 @dataclass
@@ -371,9 +395,12 @@ class GlobalPlan:
     max_expr_len: int
     num_proofs: int
 
+    # Shared assertion lookup table (deduplicated)
+    assertion_table: AssertionTable
+
     # Level 0 push data
     push_global_indices: np.ndarray    # [num_push] int32
-    push_expressions: np.ndarray       # [num_push, max_expr_len] int32
+    push_expressions: np.ndarray       # [num_push, push_width] int32
     push_expr_lengths: np.ndarray      # [num_push] int32
 
     # Assertion levels (sorted by level)
@@ -426,11 +453,10 @@ def pack_levels(
             _enc_cache[key] = tokenizer.encode_expression(expr)
         return _enc_cache[key]
 
-    # ── Compute max_expr_len from actual data ────────────────────────
-    # Scan only the graphs we're verifying — no need to scan the entire
-    # database. Assertion patterns and ehyp patterns are also scanned
-    # per-node below so max_expr_len will be correct after _pack_one_level.
-    # We use 512 as a floor and grow during packing if needed.
+    # ── Compute max_expr_len for GPU expr_buffer ─────────────────────
+    # This must cover the largest *output* expression the GPU will produce.
+    # Push node expressions and expected conclusions are good proxies.
+    # The truncation-retry loop in verify_proofs_gpu handles overflow.
     max_expr_len = 512
     for g in graphs:
         for node in g.nodes:
@@ -439,6 +465,89 @@ def pack_levels(
                     max_expr_len = len(node.expression)
         if len(g.expected_conclusion) > max_expr_len:
             max_expr_len = len(g.expected_conclusion)
+
+    # ── Build AssertionTable: one row per unique assertion label ─────
+    # Collect all unique assertion labels actually used across all graphs.
+    if verbose:
+        print(f"  Phase 2: building assertion table...", flush=True)
+    used_labels: list[str] = []
+    seen_labels: set[str] = set()
+    for g in graphs:
+        for node in g.nodes:
+            if node.node_type == "assertion" and node.label not in seen_labels:
+                seen_labels.add(node.label)
+                used_labels.append(node.label)
+
+    A = len(used_labels)
+    label_to_idx: dict[str, int] = {lbl: i for i, lbl in enumerate(used_labels)}
+
+    # Compute table dimensions
+    global_max_pat_len  = 1
+    global_max_ehyp_len = 1
+    global_max_fhyps    = 1
+    global_max_ehyps    = 1
+    for lbl in used_labels:
+        a = label_info[lbl][1]
+        if len(a.expression) > global_max_pat_len:
+            global_max_pat_len = len(a.expression)
+        if len(a.floating_hyps) > global_max_fhyps:
+            global_max_fhyps = len(a.floating_hyps)
+        if len(a.essential_hyps) > global_max_ehyps:
+            global_max_ehyps = len(a.essential_hyps)
+        for elbl in a.essential_hyps:
+            elen = len(parsed.essential_hyps[elbl].expression)
+            if elen > global_max_ehyp_len:
+                global_max_ehyp_len = elen
+
+    if verbose:
+        print(f"  Phase 2: {A} unique assertions, max_pat={global_max_pat_len}, "
+              f"max_ehyp={global_max_ehyp_len}, max_fhyps={global_max_fhyps}, "
+              f"max_ehyps={global_max_ehyps}", flush=True)
+
+    # Allocate table arrays  [A, ...]
+    tbl_pattern_toks          = np.zeros((A, global_max_pat_len),                     dtype=np.int32)
+    tbl_pattern_lengths       = np.zeros(A,                                            dtype=np.int32)
+    tbl_fhyp_var_ids          = np.zeros((A, global_max_fhyps),                       dtype=np.int32)
+    tbl_fhyp_count            = np.zeros(A,                                            dtype=np.int32)
+    tbl_ehyp_patterns         = np.zeros((A, global_max_ehyps, global_max_ehyp_len),  dtype=np.int32)
+    tbl_ehyp_pattern_lengths  = np.zeros((A, global_max_ehyps),                       dtype=np.int32)
+    tbl_ehyp_count            = np.zeros(A,                                            dtype=np.int32)
+
+    if verbose:
+        sz_gb = (tbl_pattern_toks.nbytes + tbl_ehyp_patterns.nbytes) / 1e9
+        print(f"  Phase 2: assertion table size: {sz_gb:.2f} GB", flush=True)
+
+    for i, lbl in enumerate(used_labels):
+        a = label_info[lbl][1]
+        pat_enc = _enc(a.expression)
+        tbl_pattern_lengths[i] = len(pat_enc)
+        tbl_pattern_toks[i, :len(pat_enc)] = pat_enc
+
+        n_f = len(a.floating_hyps)
+        tbl_fhyp_count[i] = n_f
+        for f_idx, flbl in enumerate(a.floating_hyps):
+            fh = parsed.floating_hyps[flbl]
+            tbl_fhyp_var_ids[i, f_idx] = tokenizer.encode_symbol(fh.variable)
+
+        n_e = len(a.essential_hyps)
+        tbl_ehyp_count[i] = n_e
+        for e_idx, elbl in enumerate(a.essential_hyps):
+            eh = parsed.essential_hyps[elbl]
+            enc = _enc(eh.expression)
+            tbl_ehyp_pattern_lengths[i, e_idx] = len(enc)
+            tbl_ehyp_patterns[i, e_idx, :len(enc)] = enc
+
+    assertion_table = AssertionTable(
+        assertion_labels=used_labels,
+        label_to_idx=label_to_idx,
+        pattern_toks=tbl_pattern_toks,
+        pattern_lengths=tbl_pattern_lengths,
+        fhyp_var_ids=tbl_fhyp_var_ids,
+        fhyp_count=tbl_fhyp_count,
+        ehyp_patterns=tbl_ehyp_patterns,
+        ehyp_pattern_lengths=tbl_ehyp_pattern_lengths,
+        ehyp_count=tbl_ehyp_count,
+    )
 
     # ── Collect nodes by level ───────────────────────────────────────
     push_nodes: list[tuple[int, ProofNode]] = []
@@ -488,47 +597,33 @@ def pack_levels(
         nodes_at_level = assertion_nodes_by_level[lvl]
         B = len(nodes_at_level)
 
-        max_inputs = max_fhyps = max_ehyps = max_ehyp_len = max_pat_len = 0
-        for pi, node in nodes_at_level:
+        max_inputs = max_fhyps = max_ehyps = 0
+        for _, node in nodes_at_level:
             a = label_info[node.label][1]
             n_f = len(a.floating_hyps)
             n_e = len(a.essential_hyps)
-            max_inputs  = max(max_inputs,  n_f + n_e)
-            max_fhyps   = max(max_fhyps,   n_f)
-            max_ehyps   = max(max_ehyps,   n_e)
-            max_pat_len = max(max_pat_len,  len(a.expression))
-            for elbl in a.essential_hyps:
-                max_ehyp_len = max(max_ehyp_len, len(parsed.essential_hyps[elbl].expression))
+            if n_f + n_e > max_inputs: max_inputs = n_f + n_e
+            if n_f > max_fhyps:        max_fhyps  = n_f
+            if n_e > max_ehyps:        max_ehyps  = n_e
 
-        max_inputs   = max(max_inputs,   1)
-        max_fhyps    = max(max_fhyps,    1)
-        max_ehyps    = max(max_ehyps,    1)
-        max_ehyp_len = max(max_ehyp_len, 1)
-        max_pat_len  = max(max_pat_len,  1)
+        max_inputs = max(max_inputs, 1)
+        max_fhyps  = max(max_fhyps,  1)
+        max_ehyps  = max(max_ehyps,  1)
 
         assertion_labels_list: list[str] = []
         theorem_labels_list:   list[str] = []
-        pattern_toks          = np.zeros((B, max_pat_len),                   dtype=np.int32)
-        pattern_lengths       = np.zeros(B,                                  dtype=np.int32)
-        input_global_indices  = np.full( (B, max_inputs), -1,                dtype=np.int32)
-        input_counts          = np.zeros(B,                                  dtype=np.int32)
-        fhyp_input_positions  = np.zeros((B, max_fhyps),                    dtype=np.int32)
-        fhyp_var_ids          = np.zeros((B, max_fhyps),                    dtype=np.int32)
-        fhyp_count            = np.zeros(B,                                  dtype=np.int32)
-        ehyp_input_positions  = np.zeros((B, max_ehyps),                    dtype=np.int32)
-        ehyp_patterns         = np.zeros((B, max_ehyps, max_ehyp_len),      dtype=np.int32)
-        ehyp_pattern_lengths  = np.zeros((B, max_ehyps),                    dtype=np.int32)
-        ehyp_count            = np.zeros(B,                                  dtype=np.int32)
-        output_global_indices = np.zeros(B,                                  dtype=np.int32)
+        assertion_idx_arr     = np.zeros(B,                    dtype=np.int32)
+        input_global_indices  = np.full((B, max_inputs), -1,   dtype=np.int32)
+        input_counts          = np.zeros(B,                    dtype=np.int32)
+        fhyp_input_positions  = np.zeros((B, max_fhyps),      dtype=np.int32)
+        ehyp_input_positions  = np.zeros((B, max_ehyps),      dtype=np.int32)
+        output_global_indices = np.zeros(B,                    dtype=np.int32)
 
         for b, (pi, node) in enumerate(nodes_at_level):
             a = label_info[node.label][1]
             assertion_labels_list.append(node.label)
             theorem_labels_list.append(graphs[pi].theorem_label)
-
-            pat_enc = _enc(a.expression)
-            pattern_lengths[b] = len(pat_enc)
-            pattern_toks[b, :len(pat_enc)] = pat_enc
+            assertion_idx_arr[b] = label_to_idx[node.label]
 
             n_f = len(a.floating_hyps)
             n_e = len(a.essential_hyps)
@@ -536,19 +631,11 @@ def pack_levels(
             for k, si in enumerate(node.input_steps):
                 input_global_indices[b, k] = global_idx_map[(pi, si)]
 
-            fhyp_count[b] = n_f
-            for f_idx, flbl in enumerate(a.floating_hyps):
-                fh = parsed.floating_hyps[flbl]
+            for f_idx in range(n_f):
                 fhyp_input_positions[b, f_idx] = f_idx
-                fhyp_var_ids[b, f_idx] = tokenizer.encode_symbol(fh.variable)
 
-            ehyp_count[b] = n_e
-            for e_idx, elbl in enumerate(a.essential_hyps):
-                eh = parsed.essential_hyps[elbl]
+            for e_idx in range(n_e):
                 ehyp_input_positions[b, e_idx] = n_f + e_idx
-                enc = _enc(eh.expression)
-                ehyp_pattern_lengths[b, e_idx] = len(enc)
-                ehyp_patterns[b, e_idx, :len(enc)] = enc
 
             output_global_indices[b] = global_idx_map[(pi, node.step_idx)]
 
@@ -559,17 +646,11 @@ def pack_levels(
             node_levels=np.full(B, lvl, dtype=np.int32),
             assertion_labels=assertion_labels_list,
             theorem_labels=theorem_labels_list,
-            pattern_toks=pattern_toks,
-            pattern_lengths=pattern_lengths,
+            assertion_idx=assertion_idx_arr,
             input_global_indices=input_global_indices,
             input_counts=input_counts,
             fhyp_input_positions=fhyp_input_positions,
-            fhyp_var_ids=fhyp_var_ids,
-            fhyp_count=fhyp_count,
             ehyp_input_positions=ehyp_input_positions,
-            ehyp_patterns=ehyp_patterns,
-            ehyp_pattern_lengths=ehyp_pattern_lengths,
-            ehyp_count=ehyp_count,
             output_global_indices=output_global_indices,
         )
 
@@ -597,6 +678,7 @@ def pack_levels(
         total_nodes=total_nodes,
         max_expr_len=max_expr_len,
         num_proofs=num_proofs,
+        assertion_table=assertion_table,
         push_global_indices=push_global_indices,
         push_expressions=push_expressions,
         push_expr_lengths=push_expr_lengths,
@@ -831,24 +913,28 @@ def _merge_sparse_levels(
 
 def _execute_level(
     batch: AssertionLevelBatch,
-    expr_buffer: torch.Tensor,    # [total_nodes, max_expr_len] int32 on device
-    expr_lengths: torch.Tensor,   # [total_nodes] int32 on device
-    node_failed: torch.Tensor,    # [total_nodes] bool on device — True = failed
+    expr_buffer: torch.Tensor,      # [total_nodes, max_expr_len] int32 on device
+    expr_lengths: torch.Tensor,     # [total_nodes] int32 on device
+    node_failed: torch.Tensor,      # [total_nodes] bool on device
     vocab_size: int,
     device: torch.device,
+    # Assertion table tensors (already on device, shared across all levels)
+    tbl_pattern_toks: torch.Tensor,          # [A, P]
+    tbl_pattern_lengths: torch.Tensor,       # [A]
+    tbl_fhyp_var_ids: torch.Tensor,          # [A, max_fhyps]
+    tbl_fhyp_count: torch.Tensor,            # [A]
+    tbl_ehyp_patterns: torch.Tensor,         # [A, max_ehyps, E]
+    tbl_ehyp_pattern_lengths: torch.Tensor,  # [A, max_ehyps]
+    tbl_ehyp_count: torch.Tensor,            # [A]
     max_chunk_B: int = 10_000,
-    prefetched: "dict[str, torch.Tensor] | None" = None,
 ) -> int:
-    """Execute all assertion nodes in a batch (one or more coalesced levels).
+    """Execute assertion nodes for one (possibly coalesced) level group.
 
-    If `prefetched` is supplied (a dict returned by _upload_batch), those
-    already-on-device tensors are used directly — no H2D transfer cost.
-    Otherwise tensors are uploaded here (fallback for callers that don't
-    use the prefetch pipeline).
-
-    For merged multi-level batches we iterate over per-level index slices
-    in ascending order so that level-L writes to expr_buffer are visible
-    before any level-(L+1) node reads from them.
+    Pattern and ehyp data are gathered from the shared assertion table
+    (one row per unique assertion, already on device) rather than being
+    stored redundantly per node.  Per-batch arrays are only the small
+    node-specific fields: assertion_idx, input_global_indices,
+    fhyp_input_positions, ehyp_input_positions, output_global_indices.
 
     Returns the max conclusion output length seen (for truncation detection).
     """
@@ -857,171 +943,129 @@ def _execute_level(
         return 0
     max_concl_output_len = 0
 
-    # ── Use pre-uploaded tensors or fall back to synchronous upload ──
-    if prefetched is not None:
-        # Tensors already on device — stream sync is handled by _run_gpu_pipeline
-        # before calling this function.
-        d = prefetched
-        pattern_toks_t    = d["pattern_toks"]
-        pattern_lengths_t = d["pattern_lengths"]
-        input_global_t    = d["input_global_indices"]
-        input_counts_t    = d["input_counts"]
-        fhyp_pos_t        = d["fhyp_input_positions"]
-        fhyp_var_t        = d["fhyp_var_ids"]
-        fhyp_count_t      = d["fhyp_count"]
-        ehyp_pos_t        = d["ehyp_input_positions"]
-        ehyp_pats_t       = d["ehyp_patterns"]
-        ehyp_pat_lens_t   = d["ehyp_pattern_lengths"]
-        ehyp_count_t      = d["ehyp_count"]
-        output_global_t   = d["output_global_indices"]
-    else:
-        pattern_toks_t    = torch.from_numpy(batch.pattern_toks).to(device)
-        pattern_lengths_t = torch.from_numpy(batch.pattern_lengths).to(device)
-        input_global_t    = torch.from_numpy(batch.input_global_indices).long().to(device)
-        input_counts_t    = torch.from_numpy(batch.input_counts).to(device)
-        fhyp_pos_t        = torch.from_numpy(batch.fhyp_input_positions).long().to(device)
-        fhyp_var_t        = torch.from_numpy(batch.fhyp_var_ids).long().to(device)
-        fhyp_count_t      = torch.from_numpy(batch.fhyp_count).to(device)
-        ehyp_pos_t        = torch.from_numpy(batch.ehyp_input_positions).long().to(device)
-        ehyp_pats_t       = torch.from_numpy(batch.ehyp_patterns).to(device)
-        ehyp_pat_lens_t   = torch.from_numpy(batch.ehyp_pattern_lengths).to(device)
-        ehyp_count_t      = torch.from_numpy(batch.ehyp_count).to(device)
-        output_global_t   = torch.from_numpy(batch.output_global_indices).long().to(device)
+    # ── Upload slim per-batch arrays ─────────────────────────────────
+    use_pinned = device.type == "cuda"
+    def _to(arr: np.ndarray, long: bool = False) -> torch.Tensor:
+        t = torch.from_numpy(arr)
+        if use_pinned:
+            t = t.pin_memory()
+        t = t.to(device, non_blocking=use_pinned)
+        return t.long() if long else t
 
-    max_inputs  = input_global_t.shape[1]
-    max_fhyps   = fhyp_pos_t.shape[1]
-    max_ehyps   = ehyp_pos_t.shape[1]
+    asrt_idx_t    = _to(batch.assertion_idx, long=True)      # [B]
+    input_global_t = _to(batch.input_global_indices, long=True)  # [B, max_inputs]
+    input_counts_t = _to(batch.input_counts)                 # [B]
+    fhyp_pos_t    = _to(batch.fhyp_input_positions, long=True)  # [B, max_fhyps]
+    ehyp_pos_t    = _to(batch.ehyp_input_positions, long=True)  # [B, max_ehyps]
+    output_global_t = _to(batch.output_global_indices, long=True)  # [B]
+
+    # ── Gather per-node assertion data from table ─────────────────────
+    # [B, P], [B], [B, max_fhyps], [B], [B, max_ehyps, E], [B, max_ehyps], [B]
+    pattern_toks_t    = tbl_pattern_toks[asrt_idx_t]
+    pattern_lengths_t = tbl_pattern_lengths[asrt_idx_t]
+    fhyp_var_t        = tbl_fhyp_var_ids[asrt_idx_t]
+    fhyp_count_t      = tbl_fhyp_count[asrt_idx_t]
+    ehyp_pats_t       = tbl_ehyp_patterns[asrt_idx_t]
+    ehyp_pat_lens_t   = tbl_ehyp_pattern_lengths[asrt_idx_t]
+    ehyp_count_t      = tbl_ehyp_count[asrt_idx_t]
+
+    max_inputs   = input_global_t.shape[1]
+    max_fhyps    = fhyp_pos_t.shape[1]
+    max_ehyps    = ehyp_pos_t.shape[1]
     max_expr_len = expr_buffer.shape[1]
 
-    # ── Build sub-level index ranges (ascending topological order) ───
-    # Single-level batch → one range (0, B).
-    # Merged batch → one contiguous range per distinct level.
+    # ── Sub-level ranges for merged batches ───────────────────────────
     if batch.level == batch.max_level:
         sublevel_ranges: list[tuple[int, int]] = [(0, B)]
     else:
-        node_levels_np = batch.node_levels  # [B] int32, sorted ascending by construction
+        node_levels_np = batch.node_levels
         unique_lvls = np.unique(node_levels_np)
         sublevel_ranges = []
         for lv in unique_lvls:
             idxs = np.where(node_levels_np == lv)[0]
             sublevel_ranges.append((int(idxs[0]), int(idxs[-1]) + 1))
 
-    # ── Outer loop: sub-levels (for correctness across merged levels) ─
-    # ── Inner loop: chunks  (for memory control within a sub-level)   ─
     for sl_start, sl_end in sublevel_ranges:
         sl_size = sl_end - sl_start
 
         for chunk_offset in range(0, sl_size, max_chunk_B):
             chunk_start = sl_start + chunk_offset
-            chunk_end = min(chunk_start + max_chunk_B, sl_end)
+            chunk_end   = min(chunk_start + max_chunk_B, sl_end)
             cB = chunk_end - chunk_start
             cs = slice(chunk_start, chunk_end)
 
-            c_pat = pattern_toks_t[cs]
-            c_pat_len = pattern_lengths_t[cs]
-            c_in_idx = input_global_t[cs]
-            c_in_count = input_counts_t[cs]
-            c_fhyp_pos = fhyp_pos_t[cs]
-            c_fhyp_var = fhyp_var_t[cs]
-            c_fhyp_count = fhyp_count_t[cs]
-            c_ehyp_pos = ehyp_pos_t[cs]
-            c_ehyp_pats = ehyp_pats_t[cs]
+            c_pat         = pattern_toks_t[cs]
+            c_pat_len     = pattern_lengths_t[cs]
+            c_in_idx      = input_global_t[cs]
+            c_in_count    = input_counts_t[cs]
+            c_fhyp_pos    = fhyp_pos_t[cs]
+            c_fhyp_var    = fhyp_var_t[cs]
+            c_fhyp_count  = fhyp_count_t[cs]
+            c_ehyp_pos    = ehyp_pos_t[cs]
+            c_ehyp_pats   = ehyp_pats_t[cs]
             c_ehyp_pat_lens = ehyp_pat_lens_t[cs]
-            c_ehyp_count = ehyp_count_t[cs]
-            c_out_idx = output_global_t[cs]
+            c_ehyp_count  = ehyp_count_t[cs]
+            c_out_idx     = output_global_t[cs]
 
-            # ── (a) Gather inputs from expr_buffer ───────────────────
-            # Clamp -1 padding to 0 for safe gather; we mask later
-            safe_in_idx = c_in_idx.clamp(min=0)
-            # [cB, max_inputs, max_expr_len]
-            inputs = expr_buffer[safe_in_idx]
-            # [cB, max_inputs]
-            input_lens = expr_lengths[safe_in_idx]
+            # ── (a) Gather inputs ─────────────────────────────────────
+            safe_in_idx   = c_in_idx.clamp(min=0)
+            inputs        = expr_buffer[safe_in_idx]       # [cB, max_inputs, max_expr_len]
+            input_lens    = expr_lengths[safe_in_idx]      # [cB, max_inputs]
+            input_failed  = node_failed[safe_in_idx]       # [cB, max_inputs]
+            in_valid      = torch.arange(max_inputs, device=device) < c_in_count.unsqueeze(1)
+            any_input_failed = (input_failed & in_valid).any(dim=1)
 
-            # Check if any input node has already failed
-            input_failed = node_failed[safe_in_idx]  # [cB, max_inputs]
-            in_valid = torch.arange(max_inputs, device=device) < c_in_count.unsqueeze(1)
-            any_input_failed = (input_failed & in_valid).any(dim=1)  # [cB]
-
-            # ── (b) Build sub_tables from floating hyps ──────────────
-            # Floating hyp input expression length - 1 (strip typecode)
-            fhyp_valid = torch.arange(max_fhyps, device=device) < c_fhyp_count.unsqueeze(1)
+            # ── (b) Build substitution tables ─────────────────────────
+            fhyp_valid    = torch.arange(max_fhyps, device=device) < c_fhyp_count.unsqueeze(1)
             safe_fhyp_pos = c_fhyp_pos.clamp(min=0, max=max_inputs - 1)
+            batch_range   = torch.arange(cB, device=device).unsqueeze(1).expand(cB, max_fhyps)
+            fhyp_input_exprs = inputs[batch_range, safe_fhyp_pos]   # [cB, max_fhyps, max_expr_len]
+            fhyp_input_lens  = input_lens[batch_range, safe_fhyp_pos]
 
-            batch_range = torch.arange(cB, device=device).unsqueeze(1).expand(cB, max_fhyps)
-            fhyp_input_exprs = inputs[batch_range, safe_fhyp_pos]  # [cB, max_fhyps, max_expr_len]
-            fhyp_input_lens = input_lens[batch_range, safe_fhyp_pos]  # [cB, max_fhyps]
-
-            # Strip typecode: substitution value = input[1:]
-            sub_values = fhyp_input_exprs[:, :, 1:]  # [cB, max_fhyps, max_expr_len-1]
-            sub_value_lens = (fhyp_input_lens - 1).clamp(min=0)  # [cB, max_fhyps]
-            max_sub_width = sub_values.shape[2]
-            sub_value_lens = sub_value_lens.clamp(max=max_sub_width)
-            S_max = max(int(sub_value_lens.max().item()), 1) if cB > 0 else 1
-
-            sub_values = sub_values[:, :, :S_max]  # [cB, max_fhyps, S_max]
+            sub_values     = fhyp_input_exprs[:, :, 1:]
+            sub_value_lens = (fhyp_input_lens - 1).clamp(min=0)
+            sub_value_lens = sub_value_lens.clamp(max=sub_values.shape[2])
+            S_max          = max(int(sub_value_lens.max().item()), 1) if cB > 0 else 1
+            sub_values     = sub_values[:, :, :S_max]
 
             V = vocab_size
-            sub_tables = torch.zeros(cB, V, S_max, dtype=torch.int32, device=device)
-            ident = torch.arange(V, device=device, dtype=torch.int32)
-            sub_tables[:, :, 0] = ident.unsqueeze(0)
+            sub_tables  = torch.zeros(cB, V, S_max, dtype=torch.int32, device=device)
+            sub_tables[:, :, 0] = torch.arange(V, device=device, dtype=torch.int32).unsqueeze(0)
             sub_lengths = torch.ones(cB, V, dtype=torch.int32, device=device)
 
             if max_fhyps > 0 and int(fhyp_valid.sum().item()) > 0:
-                s_range = torch.arange(S_max, device=device)
-                s_valid = s_range.unsqueeze(0).unsqueeze(0) < sub_value_lens.unsqueeze(2)
-                write_valid = s_valid & fhyp_valid.unsqueeze(2)
-
+                s_range    = torch.arange(S_max, device=device)
+                write_valid = (s_range.unsqueeze(0).unsqueeze(0) < sub_value_lens.unsqueeze(2)) & fhyp_valid.unsqueeze(2)
                 if write_valid.any():
-                    b_idx_3d = torch.arange(cB, device=device).view(cB, 1, 1).expand(cB, max_fhyps, S_max)
-                    v_idx_3d = c_fhyp_var.unsqueeze(2).expand(cB, max_fhyps, S_max)
-                    s_idx_3d = s_range.unsqueeze(0).unsqueeze(0).expand(cB, max_fhyps, S_max)
-
+                    b3 = torch.arange(cB, device=device).view(cB,1,1).expand(cB, max_fhyps, S_max)
+                    v3 = c_fhyp_var.unsqueeze(2).expand(cB, max_fhyps, S_max)
+                    s3 = s_range.unsqueeze(0).unsqueeze(0).expand(cB, max_fhyps, S_max)
                     wv = write_valid.reshape(-1)
-                    sub_tables[
-                        b_idx_3d.reshape(-1)[wv],
-                        v_idx_3d.reshape(-1)[wv],
-                        s_idx_3d.reshape(-1)[wv],
-                    ] = sub_values.reshape(-1)[wv]
-
-                b_idx_2d = torch.arange(cB, device=device).unsqueeze(1).expand(cB, max_fhyps)
+                    sub_tables[b3.reshape(-1)[wv], v3.reshape(-1)[wv], s3.reshape(-1)[wv]] = sub_values.reshape(-1)[wv]
+                b2 = torch.arange(cB, device=device).unsqueeze(1).expand(cB, max_fhyps)
                 fv = fhyp_valid.reshape(-1)
                 if fv.any():
-                    sub_lengths[
-                        b_idx_2d.reshape(-1)[fv],
-                        c_fhyp_var.reshape(-1)[fv],
-                    ] = sub_value_lens.reshape(-1)[fv].int()
+                    sub_lengths[b2.reshape(-1)[fv], c_fhyp_var.reshape(-1)[fv]] = sub_value_lens.reshape(-1)[fv].int()
 
-            # ── (c) Check essential hypotheses ───────────────────────
+            # ── (c) Check essential hypotheses ────────────────────────
             max_ehyps_val = int(c_ehyp_count.max().item()) if cB > 0 else 0
-            ehyp_results = torch.ones(cB, max_ehyps, dtype=torch.bool, device=device)
+            ehyp_results  = torch.ones(cB, max_ehyps, dtype=torch.bool, device=device)
+            arange_cB     = torch.arange(cB, device=device)
 
             for e in range(max_ehyps_val):
-                ehyp_pat = c_ehyp_pats[:, e, :]        # [cB, max_ehyp_len]
-                ehyp_pat_len = c_ehyp_pat_lens[:, e]    # [cB]
+                ehyp_pat        = c_ehyp_pats[:, e, :]
+                ehyp_pat_len    = c_ehyp_pat_lens[:, e]
+                safe_ep         = c_ehyp_pos[:, e].clamp(min=0, max=max_inputs - 1)
+                ehyp_target     = inputs[arange_cB, safe_ep]
+                ehyp_target_len = input_lens[arange_cB, safe_ep]
+                ehyp_out, ehyp_out_len = _apply_substitution_gpu(ehyp_pat, ehyp_pat_len, sub_tables, sub_lengths, device)
+                ehyp_results[:, e] = _verify_substitution_result(ehyp_out, ehyp_out_len, ehyp_target, ehyp_target_len, device)
 
-                ehyp_in_pos = c_ehyp_pos[:, e]          # [cB]
-                safe_ehyp_in_pos = ehyp_in_pos.clamp(min=0, max=max_inputs - 1)
-                ehyp_target = inputs[torch.arange(cB, device=device), safe_ehyp_in_pos]
-                ehyp_target_len = input_lens[torch.arange(cB, device=device), safe_ehyp_in_pos]
-
-                ehyp_output, ehyp_out_len = _apply_substitution_gpu(
-                    ehyp_pat, ehyp_pat_len, sub_tables, sub_lengths, device,
-                )
-                ehyp_match = _verify_substitution_result(
-                    ehyp_output, ehyp_out_len, ehyp_target, ehyp_target_len, device,
-                )
-                ehyp_results[:, e] = ehyp_match
-
-            # CRITICAL MASKING: masked-out ehyps forced True
             ehyp_valid_mask = torch.arange(max_ehyps, device=device) < c_ehyp_count.unsqueeze(1)
-            all_ehyps_ok = (ehyp_results | ~ehyp_valid_mask).all(dim=1)  # [cB]
+            all_ehyps_ok    = (ehyp_results | ~ehyp_valid_mask).all(dim=1)
 
-            # ── (d) Compute conclusion ───────────────────────────────
-            concl_output, concl_out_len = _apply_substitution_gpu(
-                c_pat, c_pat_len, sub_tables, sub_lengths, device,
-            )
-
+            # ── (d) Compute conclusion ────────────────────────────────
+            concl_output, concl_out_len = _apply_substitution_gpu(c_pat, c_pat_len, sub_tables, sub_lengths, device)
             max_out = concl_output.shape[1]
             max_concl_output_len = max(max_concl_output_len, max_out)
 
@@ -1030,58 +1074,10 @@ def _execute_level(
             expr_buffer[c_out_idx, :write_len] = concl_output[:, :write_len]
             expr_lengths[c_out_idx] = concl_out_len.int()
 
-            truncated = concl_out_len > max_expr_len
-            step_failed = ~all_ehyps_ok | any_input_failed | truncated
-            node_failed[c_out_idx] = step_failed
+            truncated   = concl_out_len > max_expr_len
+            node_failed[c_out_idx] = ~all_ehyps_ok | any_input_failed | truncated
 
     return max_concl_output_len
-
-
-# ── Batch tensor upload helper ─────────────────────────────────────────
-
-def _pin(arr: np.ndarray) -> torch.Tensor:
-    """Return a CPU tensor backed by page-locked memory for fast H2D."""
-    t = torch.from_numpy(arr)
-    return t.pin_memory()
-
-
-def _upload_batch(
-    batch: AssertionLevelBatch,
-    device: torch.device,
-    stream: "torch.cuda.Stream | None" = None,
-    non_blocking: bool = False,
-) -> dict[str, torch.Tensor]:
-    """Upload all numpy arrays for a batch to device, returning a dict of tensors.
-
-    On CUDA with a prefetch stream, uploads happen asynchronously so the
-    transfer overlaps with compute on the default stream.
-    """
-    def _to(arr: np.ndarray, long: bool = False) -> torch.Tensor:
-        t = torch.from_numpy(arr)
-        if non_blocking:
-            t = t.pin_memory()
-        if long:
-            t = t.long()
-        if stream is not None:
-            with torch.cuda.stream(stream):
-                return t.to(device, non_blocking=non_blocking)
-        return t.to(device, non_blocking=non_blocking)
-
-    return {
-        "pattern_toks":          _to(batch.pattern_toks),
-        "pattern_lengths":       _to(batch.pattern_lengths),
-        "input_global_indices":  _to(batch.input_global_indices, long=True),
-        "input_counts":          _to(batch.input_counts),
-        "fhyp_input_positions":  _to(batch.fhyp_input_positions, long=True),
-        "fhyp_var_ids":          _to(batch.fhyp_var_ids, long=True),
-        "fhyp_count":            _to(batch.fhyp_count),
-        "ehyp_input_positions":  _to(batch.ehyp_input_positions, long=True),
-        "ehyp_patterns":         _to(batch.ehyp_patterns),
-        "ehyp_pattern_lengths":  _to(batch.ehyp_pattern_lengths),
-        "ehyp_count":            _to(batch.ehyp_count),
-        "output_global_indices": _to(batch.output_global_indices, long=True),
-        "node_levels":           _to(batch.node_levels),
-    }
 
 
 def _run_gpu_pipeline(
@@ -1132,53 +1128,45 @@ def _run_gpu_pipeline(
     if verbose:
         print(f"    Level 0: {len(plan.push_global_indices)} push nodes written")
 
+    # ── Upload assertion table once — shared across all levels ───────
+    tbl = plan.assertion_table
+    use_pinned = device.type == "cuda"
+    def _tbl_to(arr: np.ndarray, long: bool = False) -> torch.Tensor:
+        t = torch.from_numpy(arr)
+        if use_pinned:
+            t = t.pin_memory()
+        t = t.to(device, non_blocking=use_pinned)
+        return t.long() if long else t
+
+    tbl_pattern_toks_t         = _tbl_to(tbl.pattern_toks)
+    tbl_pattern_lengths_t      = _tbl_to(tbl.pattern_lengths)
+    tbl_fhyp_var_ids_t         = _tbl_to(tbl.fhyp_var_ids, long=True)
+    tbl_fhyp_count_t           = _tbl_to(tbl.fhyp_count)
+    tbl_ehyp_patterns_t        = _tbl_to(tbl.ehyp_patterns)
+    tbl_ehyp_pattern_lengths_t = _tbl_to(tbl.ehyp_pattern_lengths)
+    tbl_ehyp_count_t           = _tbl_to(tbl.ehyp_count)
+    if use_pinned:
+        torch.cuda.synchronize(device)  # ensure table is resident before compute
+
+    if verbose:
+        print(f"    Assertion table uploaded: {len(tbl.assertion_labels)} unique assertions", flush=True)
+
     # ── Levels 1..max: assertion nodes ───────────────────────────
-    # Merge consecutive sparse levels into combined batches to avoid
-    # repeated tiny kernel dispatches and H2D transfers at the tail.
     effective_batches = _merge_sparse_levels(plan.assertion_batches)
     if verbose:
         orig_n = len(plan.assertion_batches)
         merged_n = len(effective_batches)
         if merged_n < orig_n:
-            print(f"    Level coalescing: {orig_n} → {merged_n} batches")
-
-    # ── Double-buffered async H2D prefetch (CUDA only) ───────────────
-    # While the GPU executes level i on the default stream, we upload
-    # level i+1's batch tensors on a separate prefetch stream.  The
-    # default stream waits for the prefetch stream before reading the
-    # tensors, ensuring correctness with zero extra synchronisation cost.
-    use_prefetch = device.type == "cuda" and len(effective_batches) > 0
-    prefetch_stream: "torch.cuda.Stream | None" = (
-        torch.cuda.Stream(device=device) if use_prefetch else None
-    )
-
-    def _prefetch(b: AssertionLevelBatch) -> "dict[str, torch.Tensor]":
-        return _upload_batch(b, device, stream=prefetch_stream, non_blocking=True)
-
-    # Seed: upload first batch on prefetch stream right away
-    prefetched_next = _prefetch(effective_batches[0]) if use_prefetch else None
+            print(f"    Level coalescing: {orig_n} → {merged_n} batches", flush=True)
 
     global_max_output = 0
-    for i, batch in enumerate(effective_batches):
+    for batch in effective_batches:
         t_lvl = time.perf_counter()
-
-        if use_prefetch:
-            # Kick off next batch upload before current compute starts
-            if i + 1 < len(effective_batches):
-                prefetched_next_next = _prefetch(effective_batches[i + 1])
-            else:
-                prefetched_next_next = None
-            # Default stream waits for the prefetch stream to finish
-            # uploading the current batch before executing on it.
-            torch.cuda.current_stream(device).wait_stream(prefetch_stream)  # type: ignore[arg-type]
-            current_prefetched = prefetched_next
-            prefetched_next = prefetched_next_next
-        else:
-            current_prefetched = None
-
         level_max = _execute_level(
-            batch, expr_buffer, expr_lengths, node_failed,
-            V, device, prefetched=current_prefetched,
+            batch, expr_buffer, expr_lengths, node_failed, V, device,
+            tbl_pattern_toks_t, tbl_pattern_lengths_t,
+            tbl_fhyp_var_ids_t, tbl_fhyp_count_t,
+            tbl_ehyp_patterns_t, tbl_ehyp_pattern_lengths_t, tbl_ehyp_count_t,
         )
         global_max_output = max(global_max_output, level_max)
         if verbose:
@@ -1187,10 +1175,7 @@ def _run_gpu_pipeline(
                 f"{batch.level}" if batch.level == batch.max_level
                 else f"{batch.level}-{batch.max_level}"
             )
-            print(
-                f"    Level {lvl_str}: {batch.count} assertion nodes "
-                f"in {dt:.3f}s"
-            )
+            print(f"    Level {lvl_str}: {batch.count} nodes in {dt:.3f}s", flush=True)
 
     had_truncation = global_max_output > max_expr_len
 
@@ -1200,7 +1185,7 @@ def _run_gpu_pipeline(
     final_lens = expr_lengths[final_idx]  # [num_proofs]
     final_node_fail = node_failed[final_idx]  # [num_proofs]
 
-    if use_prefetch:
+    if use_pinned:
         expected = torch.from_numpy(plan.expected_conclusions).pin_memory().to(device, non_blocking=False)
         expected_lens = torch.from_numpy(plan.conclusion_lengths).pin_memory().to(device, non_blocking=False)
     else:
