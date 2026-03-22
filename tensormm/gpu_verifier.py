@@ -455,19 +455,31 @@ def pack_levels(
                 assertion_nodes_by_level[lvl].append((pi, node))
 
     # ── Pack push nodes ──────────────────────────────────────────────
+    # Push expressions are short (2 tokens for $f, short for $e).
+    # Allocate at actual max push width — NOT max_expr_len (which can be
+    # 512+ and would produce a multi-GB array for set.mm's ~10M push nodes).
     sorted_levels = sorted(assertion_nodes_by_level.keys())
     if verbose:
         print(f"  Phase 2: packing {len(push_nodes):,} push nodes, {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
     n_push = len(push_nodes)
-    push_global_indices = np.zeros(n_push, dtype=np.int32)
-    push_expressions = np.zeros((n_push, max_expr_len), dtype=np.int32)
-    push_expr_lengths = np.zeros(n_push, dtype=np.int32)
 
-    for i, (pi, node) in enumerate(push_nodes):
-        push_global_indices[i] = global_idx_map[(pi, node.step_idx)]
+    # First pass: encode all push expressions and find actual max width
+    push_encoded: list[list[int]] = []
+    max_push_width = 1
+    for _, node in push_nodes:
         assert node.expression is not None
-        encoded = _enc(node.expression)
-        push_expr_lengths[i] = len(encoded)
+        enc = _enc(node.expression)
+        push_encoded.append(enc)
+        if len(enc) > max_push_width:
+            max_push_width = len(enc)
+
+    push_global_indices = np.zeros(n_push, dtype=np.int32)
+    push_expressions    = np.zeros((n_push, max_push_width), dtype=np.int32)
+    push_expr_lengths   = np.zeros(n_push, dtype=np.int32)
+
+    for i, ((pi, node), encoded) in enumerate(zip(push_nodes, push_encoded)):
+        push_global_indices[i] = global_idx_map[(pi, node.step_idx)]
+        push_expr_lengths[i]   = len(encoded)
         push_expressions[i, :len(encoded)] = encoded
 
     # ── Pack assertion levels ────────────────────────────────────────
