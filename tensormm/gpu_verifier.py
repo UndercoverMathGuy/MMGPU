@@ -399,8 +399,10 @@ def pack_levels(
 ) -> GlobalPlan:
     """Pack all proof graphs into level-indexed GPU-ready tensors."""
     if verbose:
-        print(f"  Phase 2: building label_info...", flush=True)
+        print(f"  Phase 2: building label_info ({len(parsed.assertions)} assertions)...", flush=True)
     label_info = _build_label_info(parsed)
+    if verbose:
+        print(f"  Phase 2: label_info done, assigning global indices...", flush=True)
 
     # ── Assign global buffer indices ─────────────────────────────────
     total_nodes = 0
@@ -409,6 +411,8 @@ def pack_levels(
         for node in g.nodes:
             global_idx_map[(pi, node.step_idx)] = total_nodes
             total_nodes += 1
+    if verbose:
+        print(f"  Phase 2: {total_nodes:,} total nodes, computing max_expr_len...", flush=True)
 
     # ── Pre-encode every unique expression once ───────────────────────
     # For set.mm, ax-mp appears in ~30k proofs. Without caching,
@@ -423,19 +427,18 @@ def pack_levels(
         return _enc_cache[key]
 
     # ── Compute max_expr_len from actual data ────────────────────────
+    # Scan only the graphs we're verifying — no need to scan the entire
+    # database. Assertion patterns and ehyp patterns are also scanned
+    # per-node below so max_expr_len will be correct after _pack_one_level.
+    # We use 512 as a floor and grow during packing if needed.
     max_expr_len = 512
     for g in graphs:
         for node in g.nodes:
             if node.expression is not None:
-                max_expr_len = max(max_expr_len, len(node.expression))
-        max_expr_len = max(max_expr_len, len(g.expected_conclusion))
-    for _, info in label_info.items():
-        if info[0] in ("$a", "$p"):
-            a = info[1]
-            max_expr_len = max(max_expr_len, len(a.expression))
-            for elbl in a.essential_hyps:
-                eh = parsed.essential_hyps[elbl]
-                max_expr_len = max(max_expr_len, len(eh.expression))
+                if len(node.expression) > max_expr_len:
+                    max_expr_len = len(node.expression)
+        if len(g.expected_conclusion) > max_expr_len:
+            max_expr_len = len(g.expected_conclusion)
 
     # ── Collect nodes by level ───────────────────────────────────────
     push_nodes: list[tuple[int, ProofNode]] = []
@@ -452,6 +455,8 @@ def pack_levels(
                 assertion_nodes_by_level[lvl].append((pi, node))
 
     # ── Pack push nodes ──────────────────────────────────────────────
+    if verbose:
+        print(f"  Phase 2: packing {len(push_nodes):,} push nodes, {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
     n_push = len(push_nodes)
     push_global_indices = np.zeros(n_push, dtype=np.int32)
     push_expressions = np.zeros((n_push, max_expr_len), dtype=np.int32)
