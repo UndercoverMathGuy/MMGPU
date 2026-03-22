@@ -407,9 +407,10 @@ class GlobalPlan:
     assertion_batches: list[AssertionLevelBatch]
 
     # Final check data
-    final_node_indices: np.ndarray     # [num_proofs] int32
-    expected_conclusions: np.ndarray   # [num_proofs, max_concl_len] int32
-    conclusion_lengths: np.ndarray     # [num_proofs] int32
+    final_node_indices: np.ndarray        # [num_proofs] int32
+    expected_conclusions: np.ndarray      # [num_proofs, max_concl_len] int32
+    conclusion_lengths: np.ndarray        # [num_proofs] int32
+    expected_conclusion_hashes: np.ndarray  # [num_proofs] int64 — polynomial hash
 
     # For $d post-check: per-proof theorem label
     proof_theorem_labels: list[str]
@@ -454,9 +455,12 @@ def pack_levels(
         return _enc_cache[key]
 
     # ── Compute max_expr_len for GPU expr_buffer ─────────────────────
-    # This must cover the largest *output* expression the GPU will produce.
-    # Push node expressions and expected conclusions are good proxies.
-    # The truncation-retry loop in verify_proofs_gpu handles overflow.
+    # Must cover all INTERMEDIATE expressions (assertion outputs used as inputs
+    # to subsequent steps). If truncated, downstream substitutions are corrupted.
+    # Also include expected conclusion lengths so the final written value fits
+    # for token comparison — EXCEPT theorems whose conclusion exceeds the cap
+    # (e.g. quartfull at 11548 tokens), which fall back to hash comparison.
+    _EXPR_BUF_CAP = 4096
     max_expr_len = 512
     for g in graphs:
         for node in g.nodes:
@@ -465,6 +469,7 @@ def pack_levels(
                     max_expr_len = len(node.expression)
         if len(g.expected_conclusion) > max_expr_len:
             max_expr_len = len(g.expected_conclusion)
+    max_expr_len = min(max_expr_len, _EXPR_BUF_CAP)
 
     # ── Build AssertionTable: one row per unique assertion label ─────
     # Collect all unique assertion labels actually used across all graphs.
@@ -661,18 +666,20 @@ def pack_levels(
     # ── Final check data ─────────────────────────────────────────────
     num_proofs = len(graphs)
     max_concl_len = max((len(g.expected_conclusion) for g in graphs), default=1)
-    final_node_indices    = np.zeros(num_proofs,              dtype=np.int32)
-    expected_conclusions  = np.zeros((num_proofs, max_concl_len), dtype=np.int32)
-    conclusion_lengths    = np.zeros(num_proofs,              dtype=np.int32)
+    final_node_indices         = np.zeros(num_proofs,               dtype=np.int32)
+    expected_conclusions       = np.zeros((num_proofs, max_concl_len), dtype=np.int32)
+    conclusion_lengths         = np.zeros(num_proofs,               dtype=np.int32)
+    expected_conclusion_hashes = np.zeros(num_proofs,               dtype=np.int64)
     proof_theorem_labels: list[str] = []
 
     for pi, g in enumerate(graphs):
         proof_theorem_labels.append(g.theorem_label)
         last_node = g.nodes[-1]
         final_node_indices[pi] = global_idx_map[(pi, last_node.step_idx)]
-        enc = _enc(g.expected_conclusion)
+        enc = np.array(_enc(g.expected_conclusion), dtype=np.int32)
         conclusion_lengths[pi] = len(enc)
         expected_conclusions[pi, :len(enc)] = enc
+        expected_conclusion_hashes[pi] = _poly_hash_np(enc)
 
     return GlobalPlan(
         total_nodes=total_nodes,
@@ -686,6 +693,7 @@ def pack_levels(
         final_node_indices=final_node_indices,
         expected_conclusions=expected_conclusions,
         conclusion_lengths=conclusion_lengths,
+        expected_conclusion_hashes=expected_conclusion_hashes,
         proof_theorem_labels=proof_theorem_labels,
         vocab_size=tokenizer.vocab_size(),
     )
@@ -694,6 +702,47 @@ def pack_levels(
 # ══════════════════════════════════════════════════════════════════════
 #  Phase 3 — GPU Execution (level by level)
 # ══════════════════════════════════════════════════════════════════════
+
+# Polynomial rolling hash base (large prime, fits int64 without overflow issues
+# when multiplied by token ids up to ~100k and added).
+_HASH_BASE = np.int64(1_000_000_007)
+
+
+_HASH_MASK = (1 << 63) - 1  # keep within signed int64 range
+
+
+def _poly_hash_np(tokens: np.ndarray) -> np.int64:
+    """Compute polynomial rolling hash of a 1-D int32 token array on CPU.
+
+    Uses Python int arithmetic (arbitrary precision) then masks to int64 so
+    the result matches the GPU int64 wrap-around behaviour exactly.
+    """
+    base = int(_HASH_BASE)
+    h = 0
+    for t in tokens:
+        h = (h * base + int(t)) & 0xFFFFFFFFFFFFFFFF
+    # Reinterpret as signed int64
+    if h >= (1 << 63):
+        h -= (1 << 64)
+    return np.int64(h)
+
+
+def _poly_hash_gpu(
+    tokens: torch.Tensor,       # [B, L] int32 — possibly padded
+    lengths: torch.Tensor,      # [B] int32
+    device: torch.device,
+) -> torch.Tensor:              # [B] int64
+    """Compute polynomial rolling hash of variable-length token rows on GPU."""
+    B, L = tokens.shape
+    h = torch.zeros(B, dtype=torch.int64, device=device)
+    base = torch.tensor(_HASH_BASE, dtype=torch.int64, device=device)
+    pos = torch.arange(L, device=device).unsqueeze(0)  # [1, L]
+    valid = pos < lengths.long().unsqueeze(1)           # [B, L]
+    for i in range(L):
+        col_valid = valid[:, i]
+        tok = tokens[:, i].long()
+        h = torch.where(col_valid, h * base + tok, h)
+    return h
 
 
 def _apply_substitution_gpu(
@@ -824,12 +873,9 @@ def _merge_sparse_levels(
         if len(pending) == 1:
             merged.append(pending[0])
         else:
-            # Determine merged max dims
-            m_max_pat = max(b.pattern_toks.shape[1] for b in pending)
             m_max_inputs = max(b.input_global_indices.shape[1] for b in pending)
-            m_max_fhyps = max(b.fhyp_input_positions.shape[1] for b in pending)
-            m_max_ehyps = max(b.ehyp_input_positions.shape[1] for b in pending)
-            m_max_ehyp_len = max(b.ehyp_patterns.shape[2] for b in pending)
+            m_max_fhyps  = max(b.fhyp_input_positions.shape[1] for b in pending)
+            m_max_ehyps  = max(b.ehyp_input_positions.shape[1] for b in pending)
             B_total = sum(b.count for b in pending)
 
             def _pad2(arr: np.ndarray, cols: int) -> np.ndarray:
@@ -838,60 +884,30 @@ def _merge_sparse_levels(
                 pad = np.zeros((arr.shape[0], cols - arr.shape[1]), dtype=arr.dtype)
                 return np.concatenate([arr, pad], axis=1)
 
-            def _pad3(arr: np.ndarray, dim1: int, dim2: int) -> np.ndarray:
-                # arr is [B, d1, d2]
-                r = arr
-                if r.shape[1] < dim1:
-                    r = np.concatenate(
-                        [r, np.zeros((r.shape[0], dim1 - r.shape[1], r.shape[2]), dtype=r.dtype)], axis=1
-                    )
-                if r.shape[2] < dim2:
-                    r = np.concatenate(
-                        [r, np.zeros((r.shape[0], r.shape[1], dim2 - r.shape[2]), dtype=r.dtype)], axis=2
-                    )
-                return r
-
-            pattern_toks      = np.concatenate([_pad2(b.pattern_toks, m_max_pat) for b in pending], axis=0)
-            pattern_lengths   = np.concatenate([b.pattern_lengths for b in pending])
-            # input_global_indices uses -1 as padding sentinel — preserve with constant_values=-1
-            input_global      = np.concatenate(
+            # input_global_indices uses -1 as padding sentinel
+            input_global = np.concatenate(
                 [np.pad(b.input_global_indices,
                         ((0, 0), (0, m_max_inputs - b.input_global_indices.shape[1])),
                         constant_values=-1)
                  for b in pending], axis=0
             )
-            input_counts      = np.concatenate([b.input_counts for b in pending])
-            fhyp_pos          = np.concatenate([_pad2(b.fhyp_input_positions, m_max_fhyps) for b in pending], axis=0)
-            fhyp_var          = np.concatenate([_pad2(b.fhyp_var_ids, m_max_fhyps) for b in pending], axis=0)
-            fhyp_count        = np.concatenate([b.fhyp_count for b in pending])
-            ehyp_pos          = np.concatenate([_pad2(b.ehyp_input_positions, m_max_ehyps) for b in pending], axis=0)
-            ehyp_pats         = np.concatenate([_pad3(b.ehyp_patterns, m_max_ehyps, m_max_ehyp_len) for b in pending], axis=0)
-            ehyp_pat_lens     = np.concatenate([_pad2(b.ehyp_pattern_lengths, m_max_ehyps) for b in pending], axis=0)
-            ehyp_count        = np.concatenate([b.ehyp_count for b in pending])
-            output_global     = np.concatenate([b.output_global_indices for b in pending])
-            node_levels_arr   = np.concatenate([b.node_levels for b in pending])
-            assertion_labels  = [lbl for b in pending for lbl in b.assertion_labels]
-            theorem_labels    = [lbl for b in pending for lbl in b.theorem_labels]
-
             merged.append(AssertionLevelBatch(
                 level=pending[0].level,
                 max_level=pending[-1].max_level,
                 count=B_total,
-                node_levels=node_levels_arr,
-                assertion_labels=assertion_labels,
-                theorem_labels=theorem_labels,
-                pattern_toks=pattern_toks,
-                pattern_lengths=pattern_lengths,
+                node_levels=np.concatenate([b.node_levels for b in pending]),
+                assertion_labels=[lbl for b in pending for lbl in b.assertion_labels],
+                theorem_labels=[lbl for b in pending for lbl in b.theorem_labels],
+                assertion_idx=np.concatenate([b.assertion_idx for b in pending]),
                 input_global_indices=input_global,
-                input_counts=input_counts,
-                fhyp_input_positions=fhyp_pos,
-                fhyp_var_ids=fhyp_var,
-                fhyp_count=fhyp_count,
-                ehyp_input_positions=ehyp_pos,
-                ehyp_patterns=ehyp_pats,
-                ehyp_pattern_lengths=ehyp_pat_lens,
-                ehyp_count=ehyp_count,
-                output_global_indices=output_global,
+                input_counts=np.concatenate([b.input_counts for b in pending]),
+                fhyp_input_positions=np.concatenate(
+                    [_pad2(b.fhyp_input_positions, m_max_fhyps) for b in pending], axis=0
+                ),
+                ehyp_input_positions=np.concatenate(
+                    [_pad2(b.ehyp_input_positions, m_max_ehyps) for b in pending], axis=0
+                ),
+                output_global_indices=np.concatenate([b.output_global_indices for b in pending]),
             ))
         pending = []
         pending_count = 0
@@ -915,6 +931,7 @@ def _execute_level(
     batch: AssertionLevelBatch,
     expr_buffer: torch.Tensor,      # [total_nodes, max_expr_len] int32 on device
     expr_lengths: torch.Tensor,     # [total_nodes] int32 on device
+    expr_hashes: torch.Tensor,      # [total_nodes] int64 on device
     node_failed: torch.Tensor,      # [total_nodes] bool on device
     vocab_size: int,
     device: torch.device,
@@ -927,7 +944,7 @@ def _execute_level(
     tbl_ehyp_pattern_lengths: torch.Tensor,  # [A, max_ehyps]
     tbl_ehyp_count: torch.Tensor,            # [A]
     max_chunk_B: int = 10_000,
-) -> int:
+) -> None:
     """Execute assertion nodes for one (possibly coalesced) level group.
 
     Pattern and ehyp data are gathered from the shared assertion table
@@ -936,12 +953,13 @@ def _execute_level(
     node-specific fields: assertion_idx, input_global_indices,
     fhyp_input_positions, ehyp_input_positions, output_global_indices.
 
-    Returns the max conclusion output length seen (for truncation detection).
+    Stores a polynomial rolling hash of each conclusion in expr_hashes so
+    that expressions longer than max_expr_len can still be compared correctly
+    at the final check step without ever allocating a buffer for them.
     """
     B = batch.count
     if B == 0:
-        return 0
-    max_concl_output_len = 0
+        return
 
     # ── Upload slim per-batch arrays ─────────────────────────────────
     use_pinned = device.type == "cuda"
@@ -952,12 +970,24 @@ def _execute_level(
         t = t.to(device, non_blocking=use_pinned)
         return t.long() if long else t
 
-    asrt_idx_t    = _to(batch.assertion_idx, long=True)      # [B]
-    input_global_t = _to(batch.input_global_indices, long=True)  # [B, max_inputs]
-    input_counts_t = _to(batch.input_counts)                 # [B]
-    fhyp_pos_t    = _to(batch.fhyp_input_positions, long=True)  # [B, max_fhyps]
-    ehyp_pos_t    = _to(batch.ehyp_input_positions, long=True)  # [B, max_ehyps]
-    output_global_t = _to(batch.output_global_indices, long=True)  # [B]
+    asrt_idx_t     = _to(batch.assertion_idx, long=True)           # [B]
+    input_global_t = _to(batch.input_global_indices, long=True)   # [B, max_inputs]
+    input_counts_t = _to(batch.input_counts)                      # [B]
+    output_global_t = _to(batch.output_global_indices, long=True) # [B]
+
+    # Position arrays may be narrower than the table's max_fhyps/max_ehyps
+    # (e.g. when batches with few hyps are merged). Pad with 0 so that
+    # out-of-range positions are masked away by fhyp_valid/ehyp_valid.
+    tbl_max_fhyps = tbl_fhyp_var_ids.shape[1]
+    tbl_max_ehyps = tbl_ehyp_patterns.shape[1]
+    fhyp_pos_np = batch.fhyp_input_positions
+    ehyp_pos_np = batch.ehyp_input_positions
+    if fhyp_pos_np.shape[1] < tbl_max_fhyps:
+        fhyp_pos_np = np.pad(fhyp_pos_np, ((0, 0), (0, tbl_max_fhyps - fhyp_pos_np.shape[1])))
+    if ehyp_pos_np.shape[1] < tbl_max_ehyps:
+        ehyp_pos_np = np.pad(ehyp_pos_np, ((0, 0), (0, tbl_max_ehyps - ehyp_pos_np.shape[1])))
+    fhyp_pos_t = _to(fhyp_pos_np, long=True)  # [B, tbl_max_fhyps]
+    ehyp_pos_t = _to(ehyp_pos_np, long=True)  # [B, tbl_max_ehyps]
 
     # ── Gather per-node assertion data from table ─────────────────────
     # [B, P], [B], [B, max_fhyps], [B], [B, max_ehyps, E], [B, max_ehyps], [B]
@@ -970,8 +1000,11 @@ def _execute_level(
     ehyp_count_t      = tbl_ehyp_count[asrt_idx_t]
 
     max_inputs   = input_global_t.shape[1]
-    max_fhyps    = fhyp_pos_t.shape[1]
-    max_ehyps    = ehyp_pos_t.shape[1]
+    # fhyp/ehyp dims must come from the table-gathered tensors (not the batch
+    # position arrays) because merged batches may have fewer position columns
+    # than the table's max — using batch dims would cause shape mismatches.
+    max_fhyps    = tbl_fhyp_var_ids.shape[1]
+    max_ehyps    = tbl_ehyp_patterns.shape[1]
     max_expr_len = expr_buffer.shape[1]
 
     # ── Sub-level ranges for merged batches ───────────────────────────
@@ -1067,17 +1100,19 @@ def _execute_level(
             # ── (d) Compute conclusion ────────────────────────────────
             concl_output, concl_out_len = _apply_substitution_gpu(c_pat, c_pat_len, sub_tables, sub_lengths, device)
             max_out = concl_output.shape[1]
-            max_concl_output_len = max(max_concl_output_len, max_out)
 
             write_len = min(max_out, max_expr_len)
             expr_buffer[c_out_idx] = 0
             expr_buffer[c_out_idx, :write_len] = concl_output[:, :write_len]
             expr_lengths[c_out_idx] = concl_out_len.int()
 
-            truncated   = concl_out_len > max_expr_len
-            node_failed[c_out_idx] = ~all_ehyps_ok | any_input_failed | truncated
+            # Compute rolling hash of the full output (not truncated) so that
+            # expressions longer than max_expr_len can still be compared correctly.
+            expr_hashes[c_out_idx] = _poly_hash_gpu(concl_output, concl_out_len, device)
 
-    return max_concl_output_len
+            node_failed[c_out_idx] = ~all_ehyps_ok | any_input_failed
+
+    return
 
 
 def _run_gpu_pipeline(
@@ -1088,21 +1123,27 @@ def _run_gpu_pipeline(
 ) -> tuple[np.ndarray, bool, int]:
     """Single run of the GPU pipeline with a given max_expr_len.
 
+    Intermediate expressions that exceed max_expr_len are stored truncated —
+    this corrupts downstream substitutions, so the caller must retry with a
+    larger buffer if this happens.
+
+    Final-step expressions that exceed max_expr_len are compared via rolling
+    hash (expr_hashes), so no retry is needed for those.
+
     Returns:
-        (per_proof_passed, had_truncation, needed_expr_len)
+        (per_proof_passed, had_intermediate_truncation, max_intermediate_len)
     """
     total_nodes = plan.total_nodes
     V = plan.vocab_size
 
     if total_nodes == 0:
-        return np.ones(plan.num_proofs, dtype=np.bool_), False, 0
+        return np.ones(plan.num_proofs, dtype=np.bool_)
 
     # Allocate expr_buffer and tracking tensors on GPU
-    expr_buffer = torch.zeros(
-        total_nodes, max_expr_len, dtype=torch.int32, device=device
-    )
+    expr_buffer  = torch.zeros(total_nodes, max_expr_len, dtype=torch.int32, device=device)
     expr_lengths = torch.zeros(total_nodes, dtype=torch.int32, device=device)
-    node_failed = torch.zeros(total_nodes, dtype=torch.bool, device=device)
+    expr_hashes  = torch.zeros(total_nodes, dtype=torch.int64, device=device)
+    node_failed  = torch.zeros(total_nodes, dtype=torch.bool,  device=device)
 
     # ── Level 0: write push node expressions ─────────────────────
     use_pinned = device.type == "cuda"
@@ -1124,6 +1165,11 @@ def _run_gpu_pipeline(
         write_w = push_exprs_t.shape[1]
         expr_buffer[push_idx, :write_w] = push_exprs_t
         expr_lengths[push_idx] = push_lens.int()
+        # Push expressions are short (≤ max_expr_len), so hash == token comparison;
+        # compute it anyway so expr_hashes is consistent for all nodes.
+        expr_hashes[push_idx] = _poly_hash_gpu(
+            expr_buffer[push_idx, :write_w], push_lens.int(), device
+        )
 
     if verbose:
         print(f"    Level 0: {len(plan.push_global_indices)} push nodes written")
@@ -1159,16 +1205,14 @@ def _run_gpu_pipeline(
         if merged_n < orig_n:
             print(f"    Level coalescing: {orig_n} → {merged_n} batches", flush=True)
 
-    global_max_output = 0
     for batch in effective_batches:
         t_lvl = time.perf_counter()
-        level_max = _execute_level(
-            batch, expr_buffer, expr_lengths, node_failed, V, device,
+        _execute_level(
+            batch, expr_buffer, expr_lengths, expr_hashes, node_failed, V, device,
             tbl_pattern_toks_t, tbl_pattern_lengths_t,
             tbl_fhyp_var_ids_t, tbl_fhyp_count_t,
             tbl_ehyp_patterns_t, tbl_ehyp_pattern_lengths_t, tbl_ehyp_count_t,
         )
-        global_max_output = max(global_max_output, level_max)
         if verbose:
             dt = time.perf_counter() - t_lvl
             lvl_str = (
@@ -1177,22 +1221,40 @@ def _run_gpu_pipeline(
             )
             print(f"    Level {lvl_str}: {batch.count} nodes in {dt:.3f}s", flush=True)
 
-    had_truncation = global_max_output > max_expr_len
+    # ── Check for intermediate truncation ────────────────────────────
+    # If any non-final node has expr_lengths > max_expr_len, its stored value
+    # is truncated, which will corrupt downstream substitutions. The caller
+    # must retry with a larger buffer.
+    all_lens = expr_lengths  # [total_nodes]
+    # Build a mask of final nodes to exclude them from intermediate check
+    final_mask = torch.zeros(plan.total_nodes, dtype=torch.bool, device=device)
+    final_idx_t = torch.from_numpy(plan.final_node_indices).long().to(device)
+    final_mask[final_idx_t] = True
+    intermediate_lens = all_lens.masked_fill(final_mask, 0)
+    max_intermediate = int(intermediate_lens.max().item())
+    had_intermediate_truncation = max_intermediate > max_expr_len
 
     # ── Final check: compare last node expression to expected conclusion ──
-    final_idx = torch.from_numpy(plan.final_node_indices).long().to(device)
-    final_exprs = expr_buffer[final_idx]  # [num_proofs, max_expr_len]
-    final_lens = expr_lengths[final_idx]  # [num_proofs]
-    final_node_fail = node_failed[final_idx]  # [num_proofs]
+    final_lens      = expr_lengths[final_idx_t]       # [num_proofs] int32
+    final_hashes    = expr_hashes[final_idx_t]        # [num_proofs] int64
+    final_node_fail = node_failed[final_idx_t]        # [num_proofs] bool
 
     if use_pinned:
-        expected = torch.from_numpy(plan.expected_conclusions).pin_memory().to(device, non_blocking=False)
-        expected_lens = torch.from_numpy(plan.conclusion_lengths).pin_memory().to(device, non_blocking=False)
+        expected_lens   = torch.from_numpy(plan.conclusion_lengths).pin_memory().to(device, non_blocking=False)
+        expected_hashes = torch.from_numpy(plan.expected_conclusion_hashes).pin_memory().to(device, non_blocking=False)
+        expected        = torch.from_numpy(plan.expected_conclusions).pin_memory().to(device, non_blocking=False)
     else:
-        expected = torch.from_numpy(plan.expected_conclusions).to(device)
-        expected_lens = torch.from_numpy(plan.conclusion_lengths).to(device)
+        expected_lens   = torch.from_numpy(plan.conclusion_lengths).to(device)
+        expected_hashes = torch.from_numpy(plan.expected_conclusion_hashes).to(device)
+        expected        = torch.from_numpy(plan.expected_conclusions).to(device)
 
-    # Pad to same width if needed
+    length_match = (final_lens == expected_lens)
+
+    # For final expressions that fit in expr_buffer: compare tokens (exact).
+    # For final expressions longer than max_expr_len: compare rolling hashes.
+    fits_in_buffer = final_lens <= max_expr_len
+
+    final_exprs = expr_buffer[final_idx_t]  # [num_proofs, max_expr_len]
     w1 = final_exprs.shape[1]
     w2 = expected.shape[1]
     if w1 < w2:
@@ -1201,19 +1263,16 @@ def _run_gpu_pipeline(
         expected = torch.nn.functional.pad(expected, (0, w1 - w2))
 
     compare_dim = max(w1, w2)
-    positions = torch.arange(compare_dim, device=device).unsqueeze(0)
-    valid_mask = positions < final_lens.unsqueeze(1)
-    masked_eq = (final_exprs == expected) | ~valid_mask
-    content_match = masked_eq.all(dim=1)
-    length_match = (final_lens == expected_lens)
+    positions   = torch.arange(compare_dim, device=device).unsqueeze(0)
+    valid_mask  = positions < final_lens.unsqueeze(1)
+    masked_eq   = (final_exprs == expected) | ~valid_mask
+    token_match = masked_eq.all(dim=1)
+
+    hash_match = (final_hashes == expected_hashes)
+    content_match = torch.where(fits_in_buffer, token_match, hash_match)
 
     proof_passed = length_match & content_match & ~final_node_fail
-    result = proof_passed.cpu().numpy()
-
-    return result, had_truncation, global_max_output
-
-
-_MAX_EXPR_LEN_CAP = 16384  # absolute safety cap
+    return proof_passed.cpu().numpy(), had_intermediate_truncation, max_intermediate
 
 # ── CUDA warmup ────────────────────────────────────────────────────────
 _CUDA_WARMED_UP: set[str] = set()
@@ -1314,6 +1373,9 @@ def warmup_cuda(device: torch.device) -> None:
     _CUDA_WARMED_UP.add(key)
 
 
+_MAX_EXPR_LEN_CAP = 16384  # absolute safety cap
+
+
 def verify_proofs_gpu(
     plan: GlobalPlan,
     device: torch.device,
@@ -1321,8 +1383,11 @@ def verify_proofs_gpu(
 ) -> tuple[np.ndarray, float]:
     """Execute the full GPU verification pipeline.
 
-    Automatically retries with a larger expr_buffer if intermediate
-    expressions exceed the initial buffer size.
+    Retries with a larger expr_buffer only when INTERMEDIATE nodes are
+    truncated (which corrupts downstream substitutions). Final-step
+    expressions that exceed the buffer are compared via rolling hash
+    (expr_hashes), so no retry is needed for those — this handles
+    quartfull's 11548-token conclusion without a 278 GB allocation.
 
     Returns:
         (per_proof_passed: np.ndarray[bool], gpu_time: float)
@@ -1336,16 +1401,14 @@ def verify_proofs_gpu(
         )
         if not had_truncation:
             break
-        # Retry with a larger buffer
-        new_len = max(needed + 64, max_expr_len * 2)
-        new_len = min(new_len, _MAX_EXPR_LEN_CAP)
+        new_len = min(max(needed + 64, max_expr_len * 2), _MAX_EXPR_LEN_CAP)
         if verbose:
             print(
-                f"    ⚠ Truncation detected: max output {needed} > "
-                f"buffer {max_expr_len}. Retrying with {new_len}..."
+                f"    Intermediate truncation: max intermediate {needed} > "
+                f"buffer {max_expr_len}. Retrying with {new_len}...", flush=True
             )
         if new_len <= max_expr_len:
-            break  # can't grow further
+            break
         max_expr_len = new_len
 
     gpu_time = time.perf_counter() - t0

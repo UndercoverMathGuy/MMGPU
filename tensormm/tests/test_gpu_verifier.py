@@ -170,9 +170,9 @@ class TestLevelPacking:
         assert plan.max_expr_len >= 1
         assert plan.num_proofs == len(graphs)
         assert len(plan.push_global_indices) > 0
-        assert plan.push_expressions.shape == (
-            len(plan.push_global_indices), plan.max_expr_len
-        )
+        # push_expressions is stored at actual max push width, not max_expr_len
+        assert plan.push_expressions.shape[0] == len(plan.push_global_indices)
+        assert plan.push_expressions.shape[1] >= 1
 
     def test_ql_pack(self) -> None:
         """Level packing on ql.mm should handle essential hyps."""
@@ -187,13 +187,9 @@ class TestLevelPacking:
         graphs, _ = build_all_proof_graphs(parsed, theorems)
         plan = pack_levels(graphs, parsed, tokenizer)
 
-        # ql.mm should have assertion levels with essential hyps
-        has_ehyps = False
-        for batch in plan.assertion_batches:
-            if batch.ehyp_count.max() > 0:
-                has_ehyps = True
-                break
-        assert has_ehyps, "ql.mm should have assertions with essential hypotheses"
+        # ql.mm should have assertions with essential hyps in the table
+        assert plan.assertion_table.ehyp_count.max() > 0, \
+            "ql.mm should have assertions with essential hypotheses"
 
     def test_max_expr_len_not_hardcoded(self) -> None:
         """max_expr_len should be computed from data, not hardcoded small."""
