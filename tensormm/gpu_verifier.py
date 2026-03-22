@@ -427,6 +427,11 @@ class GlobalPlan:
     # Tokenizer for decoding error messages
     vocab_size: int
 
+    # Per-proof start offset in the global buffer: global_idx of proof pi's
+    # first node = graph_offsets[pi].  Length num_proofs+1 (last entry =
+    # total_nodes) so that proof pi's node range is [offsets[pi], offsets[pi+1]).
+    graph_offsets: np.ndarray  # [num_proofs+1] int64
+
 
 def pack_levels(
     graphs: list[ProofGraph],
@@ -447,11 +452,12 @@ def pack_levels(
     #     global_idx = graph_offsets[pi] + node.step_idx
     # This replaces a Python dict with ~200 bytes/entry overhead with a
     # compact numpy int64 array (8 bytes/entry).
-    graph_offsets = np.empty(len(graphs), dtype=np.int64)
+    graph_offsets = np.empty(len(graphs) + 1, dtype=np.int64)
     total_nodes = 0
     for pi, g in enumerate(graphs):
         graph_offsets[pi] = total_nodes
         total_nodes += len(g.nodes)
+    graph_offsets[len(graphs)] = total_nodes
     if verbose:
         print(f"  Phase 2: {total_nodes:,} total nodes, computing max_expr_len...", flush=True)
 
@@ -733,6 +739,7 @@ def pack_levels(
         expected_conclusion_hashes=expected_conclusion_hashes,
         proof_theorem_labels=proof_theorem_labels,
         vocab_size=tokenizer.vocab_size(),
+        graph_offsets=graph_offsets,
     )
 
 
@@ -1495,6 +1502,137 @@ def warmup_cuda(device: torch.device) -> None:
 _MAX_EXPR_LEN_CAP = 16384  # absolute safety cap
 
 
+def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan"]:
+    """Split a GlobalPlan into two halves by proof index.
+
+    Proof indices [0, split) go to plan_a, [split, num_proofs) go to plan_b.
+    Global buffer indices are re-based so each half starts at 0.
+
+    The AssertionTable is shared (read-only) — both halves reference the same object.
+    AssertionLevelBatch rows are filtered by which half their output_global_index falls in.
+    """
+    N = plan.num_proofs
+    assert 0 < split < N
+
+    # ── Per-proof data splits ─────────────────────────────────────────
+    def _split_arr(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return a[:split], a[split:]
+
+    final_a, final_b         = _split_arr(plan.final_node_indices)
+    concl_a, concl_b         = _split_arr(plan.expected_conclusions)
+    clen_a, clen_b           = _split_arr(plan.conclusion_lengths)
+    chash_a, chash_b         = _split_arr(plan.expected_conclusion_hashes)
+    labels_a                 = plan.proof_theorem_labels[:split]
+    labels_b                 = plan.proof_theorem_labels[split:]
+
+    labels_a_set = set(labels_a)
+
+    # graph_offsets[split] is the exact first global buffer index of proof
+    # `split` — trivially correct since pack_levels stores it directly.
+    offset_split = int(plan.graph_offsets[split])
+
+    # ── Push data splits ─────────────────────────────────────────────
+    push_mask_a = plan.push_global_indices < offset_split
+    push_mask_b = ~push_mask_a
+
+    push_gi_a = plan.push_global_indices[push_mask_a]
+    push_gi_b = plan.push_global_indices[push_mask_b] - offset_split  # re-base
+    push_ex_a = plan.push_expressions[push_mask_a]
+    push_ex_b = plan.push_expressions[push_mask_b]
+    push_el_a = plan.push_expr_lengths[push_mask_a]
+    push_el_b = plan.push_expr_lengths[push_mask_b]
+
+    # ── Re-base per-proof final indices ──────────────────────────────
+    final_a_rebased = final_a.copy()  # already in [0, offset_split)
+    final_b_rebased = (final_b - offset_split).astype(np.int32)
+
+    # ── Split assertion batches ───────────────────────────────────────
+    def _split_batch(batch: AssertionLevelBatch) -> tuple[AssertionLevelBatch | None,
+                                                          AssertionLevelBatch | None]:
+        mask_a = np.array([lbl in labels_a_set for lbl in batch.theorem_labels], dtype=bool)
+        mask_b = ~mask_a
+
+        def _make_half(mask: np.ndarray, rebase: int) -> AssertionLevelBatch | None:
+            if not mask.any():
+                return None
+            idx = np.where(mask)[0]
+            new_out = batch.output_global_indices[mask] - rebase
+            new_in  = batch.input_global_indices[mask].copy()
+            # Remap non-sentinel input indices
+            valid   = new_in >= 0
+            new_in[valid] = new_in[valid] - rebase
+            return AssertionLevelBatch(
+                level=batch.level,
+                max_level=batch.max_level,
+                count=int(mask.sum()),
+                node_levels=batch.node_levels[mask],
+                assertion_labels=[batch.assertion_labels[i] for i in idx],
+                theorem_labels=[batch.theorem_labels[i] for i in idx],
+                assertion_idx=batch.assertion_idx[mask],
+                input_global_indices=new_in.astype(np.int32),
+                input_counts=batch.input_counts[mask],
+                fhyp_input_positions=batch.fhyp_input_positions[mask],
+                ehyp_input_positions=batch.ehyp_input_positions[mask],
+                output_global_indices=new_out.astype(np.int32),
+                sublevel_ranges=None,  # recomputed at runtime
+            )
+
+        return _make_half(mask_a, 0), _make_half(mask_b, offset_split)
+
+    batches_a: list[AssertionLevelBatch] = []
+    batches_b: list[AssertionLevelBatch] = []
+    for batch in plan.assertion_batches:
+        ba, bb = _split_batch(batch)
+        if ba is not None:
+            batches_a.append(ba)
+        if bb is not None:
+            batches_b.append(bb)
+
+    total_nodes_a = offset_split
+    total_nodes_b = plan.total_nodes - offset_split
+
+    # graph_offsets for each half: slice + rebase
+    go_a = plan.graph_offsets[:split + 1].copy()          # [0..split] entries, already 0-based
+    go_b = plan.graph_offsets[split:].copy() - offset_split  # rebase to 0
+    go_b = go_b.astype(np.int64)
+
+    plan_a = GlobalPlan(
+        total_nodes=total_nodes_a,
+        max_expr_len=plan.max_expr_len,
+        num_proofs=split,
+        assertion_table=plan.assertion_table,  # shared, read-only
+        push_global_indices=push_gi_a,
+        push_expressions=push_ex_a,
+        push_expr_lengths=push_el_a,
+        assertion_batches=batches_a,
+        final_node_indices=final_a_rebased,
+        expected_conclusions=concl_a,
+        conclusion_lengths=clen_a,
+        expected_conclusion_hashes=chash_a,
+        proof_theorem_labels=labels_a,
+        vocab_size=plan.vocab_size,
+        graph_offsets=go_a,
+    )
+    plan_b = GlobalPlan(
+        total_nodes=total_nodes_b,
+        max_expr_len=plan.max_expr_len,
+        num_proofs=N - split,
+        assertion_table=plan.assertion_table,  # shared, read-only
+        push_global_indices=push_gi_b,
+        push_expressions=push_ex_b,
+        push_expr_lengths=push_el_b,
+        assertion_batches=batches_b,
+        final_node_indices=final_b_rebased,
+        expected_conclusions=concl_b,
+        conclusion_lengths=clen_b,
+        expected_conclusion_hashes=chash_b,
+        proof_theorem_labels=labels_b,
+        vocab_size=plan.vocab_size,
+        graph_offsets=go_b,
+    )
+    return plan_a, plan_b
+
+
 def verify_proofs_gpu(
     plan: GlobalPlan,
     device: torch.device,
@@ -1630,6 +1768,66 @@ def _select_device() -> torch.device:
     return torch.device("cpu")
 
 
+def _verify_proofs_gpu_multi(
+    plan: GlobalPlan,
+    num_gpus: int,
+    verbose: bool = False,
+) -> tuple[np.ndarray, float]:
+    """Run GPU verification split evenly across multiple GPUs using threads.
+
+    Splits the plan by proof index into num_gpus shards, runs each shard on
+    a separate GPU in parallel via Python threads (GIL is released during
+    CUDA ops), then concatenates results in order.
+    """
+    import threading
+
+    N = plan.num_proofs
+    t0 = time.perf_counter()
+
+    # Build split points: roughly equal proof counts per GPU
+    split_points = [round(N * i / num_gpus) for i in range(num_gpus + 1)]
+    # split_points[0]=0, split_points[num_gpus]=N
+
+    # Split the plan into shards
+    shards: list[GlobalPlan] = []
+    remaining = plan
+    for i in range(num_gpus - 1):
+        # Each split cuts off the first chunk from the remaining plan
+        chunk_size = split_points[i + 1] - split_points[i]
+        shard, remaining = _split_plan(remaining, chunk_size)
+        shards.append(shard)
+    shards.append(remaining)
+
+    results: list[np.ndarray | None] = [None] * num_gpus
+    errors: list[Exception | None] = [None] * num_gpus
+
+    def _run_shard(idx: int, shard: GlobalPlan) -> None:
+        dev = torch.device(f"cuda:{idx}")
+        try:
+            warmup_cuda(dev)
+            result, _ = verify_proofs_gpu(shard, dev, verbose=verbose)
+            results[idx] = result
+        except Exception as e:
+            errors[idx] = e
+
+    threads = [
+        threading.Thread(target=_run_shard, args=(i, shards[i]), daemon=True)
+        for i in range(num_gpus)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for i, err in enumerate(errors):
+        if err is not None:
+            raise RuntimeError(f"GPU {i} shard failed: {err}") from err
+
+    proof_passed = np.concatenate([r for r in results if r is not None])
+    t_gpu = time.perf_counter() - t0
+    return proof_passed, t_gpu
+
+
 def verify_database(
     parsed: ParsedDatabase,
     theorem_labels: list[str] | None = None,
@@ -1714,7 +1912,13 @@ def verify_database(
         )
 
     # ── Phase 3: GPU execution ───────────────────────────────────
-    proof_passed, t_gpu = verify_proofs_gpu(plan, device, verbose=verbose)
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    if num_gpus >= 2 and plan.num_proofs >= 2:
+        if verbose:
+            print(f"  Phase 3: distributing across {num_gpus} GPUs...", flush=True)
+        proof_passed, t_gpu = _verify_proofs_gpu_multi(plan, num_gpus, verbose=verbose)
+    else:
+        proof_passed, t_gpu = verify_proofs_gpu(plan, device, verbose=verbose)
     if verbose:
         n_pass = int(proof_passed.sum())
         print(
