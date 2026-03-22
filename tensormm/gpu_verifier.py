@@ -1784,19 +1784,31 @@ def _verify_proofs_gpu_multi(
     N = plan.num_proofs
     t0 = time.perf_counter()
 
-    # Build split points: roughly equal proof counts per GPU
-    split_points = [round(N * i / num_gpus) for i in range(num_gpus + 1)]
-    # split_points[0]=0, split_points[num_gpus]=N
+    # Build split points by node count, not proof count.
+    # graph_offsets[pi] = cumulative nodes up to proof pi, so we find the
+    # proof index where the cumulative node count crosses each target fraction.
+    total_nodes = plan.total_nodes
+    split_points = [0]
+    for i in range(1, num_gpus):
+        target = total_nodes * i // num_gpus
+        # bisect to find first proof whose start offset >= target
+        pi = int(np.searchsorted(plan.graph_offsets, target, side='left'))
+        pi = max(split_points[-1] + 1, min(pi, N - (num_gpus - i)))
+        split_points.append(pi)
+    split_points.append(N)
 
-    # Split the plan into shards
+    # Split the plan into shards using absolute proof indices
     shards: list[GlobalPlan] = []
     remaining = plan
     for i in range(num_gpus - 1):
-        # Each split cuts off the first chunk from the remaining plan
         chunk_size = split_points[i + 1] - split_points[i]
         shard, remaining = _split_plan(remaining, chunk_size)
         shards.append(shard)
     shards.append(remaining)
+
+    if verbose:
+        for i, s in enumerate(shards):
+            print(f"    GPU {i}: {s.num_proofs} proofs, {s.total_nodes:,} nodes", flush=True)
 
     results: list[np.ndarray | None] = [None] * num_gpus
     errors: list[Exception | None] = [None] * num_gpus
