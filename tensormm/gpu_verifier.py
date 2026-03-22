@@ -455,6 +455,7 @@ def pack_levels(
                 assertion_nodes_by_level[lvl].append((pi, node))
 
     # ── Pack push nodes ──────────────────────────────────────────────
+    sorted_levels = sorted(assertion_nodes_by_level.keys())
     if verbose:
         print(f"  Phase 2: packing {len(push_nodes):,} push nodes, {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
     n_push = len(push_nodes)
@@ -469,8 +470,7 @@ def pack_levels(
         push_expr_lengths[i] = len(encoded)
         push_expressions[i, :len(encoded)] = encoded
 
-    # ── Pack assertion levels (parallel) ────────────────────────────
-    sorted_levels = sorted(assertion_nodes_by_level.keys())
+    # ── Pack assertion levels ────────────────────────────────────────
 
     def _pack_one_level(lvl: int) -> AssertionLevelBatch:
         nodes_at_level = assertion_nodes_by_level[lvl]
