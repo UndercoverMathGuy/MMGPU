@@ -460,7 +460,12 @@ def pack_levels(
     # Also include expected conclusion lengths so the final written value fits
     # for token comparison — EXCEPT theorems whose conclusion exceeds the cap
     # (e.g. quartfull at 11548 tokens), which fall back to hash comparison.
-    _EXPR_BUF_CAP = 4096
+    #
+    # Cap at 1024: the actual max intermediate expression in set.mm is 796
+    # tokens (mulsasslem1/2). Giving 28% headroom keeps expr_buffer at
+    # 6M × 1024 × 4 = ~24 GB on set.mm, vs 98 GB at 4096 or 278 GB at 11548.
+    # Theorems with conclusions > 1024 use rolling-hash comparison instead.
+    _EXPR_BUF_CAP = 1024
     max_expr_len = 512
     for g in graphs:
         for node in g.nodes:
