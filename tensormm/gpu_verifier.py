@@ -35,9 +35,13 @@ from tensormm.tokenizer import Tokenizer
 # ══════════════════════════════════════════════════════════════════════
 
 
-@dataclass
+@dataclass(slots=True)
 class ProofNode:
-    """One node in a proof's dependency graph."""
+    """One node in a proof's dependency graph.
+
+    Uses __slots__ to reduce per-object memory from ~400+ bytes (dict-based)
+    to ~100 bytes. For set.mm with ~6M nodes, this saves ~1.8 GB.
+    """
     step_idx: int           # step index within this proof
     node_type: str          # "push_f", "push_e", "assertion"
     label: str              # the label referenced
@@ -621,11 +625,18 @@ def pack_levels(
         nodes_at_level = assertion_nodes_by_level[lvl]
         B = len(nodes_at_level)
 
+        # Single-pass: compute dimensions AND collect per-node data
+        # simultaneously. The old code iterated nodes_at_level twice
+        # (once for dimensions, once for array fill) with redundant
+        # label_info lookups. This merges both into one pass.
         max_inputs = max_fhyps = max_ehyps = 0
-        for _, node in nodes_at_level:
+        # Pre-collect assertion info to avoid double dict lookups
+        node_info: list[tuple[int, ProofNode, int, int]] = []  # (pi, node, n_f, n_e)
+        for pi, node in nodes_at_level:
             a = label_info[node.label][1]
             n_f = len(a.floating_hyps)
             n_e = len(a.essential_hyps)
+            node_info.append((pi, node, n_f, n_e))
             if n_f + n_e > max_inputs: max_inputs = n_f + n_e
             if n_f > max_fhyps:        max_fhyps  = n_f
             if n_e > max_ehyps:        max_ehyps  = n_e
@@ -643,14 +654,10 @@ def pack_levels(
         ehyp_input_positions  = np.zeros((B, max_ehyps),      dtype=np.int32)
         output_global_indices = np.zeros(B,                    dtype=np.int32)
 
-        for b, (pi, node) in enumerate(nodes_at_level):
-            a = label_info[node.label][1]
+        for b, (pi, node, n_f, n_e) in enumerate(node_info):
             assertion_labels_list.append(node.label)
             theorem_labels_list.append(graphs[pi].theorem_label)
             assertion_idx_arr[b] = label_to_idx[node.label]
-
-            n_f = len(a.floating_hyps)
-            n_e = len(a.essential_hyps)
             input_counts[b] = n_f + n_e
             for k, si in enumerate(node.input_steps):
                 input_global_indices[b, k] = int(graph_offsets[pi]) + si
@@ -837,41 +844,51 @@ def _apply_substitution_compact(
         return (torch.zeros(B, 1, dtype=torch.int32, device=device),
                 torch.zeros(B, dtype=torch.int32, device=device))
 
-    # STEP 4: SCATTER
+    # STEP 4: SCATTER — fully vectorized (no Python position loop).
+    # Old code looped `for p in range(actual_P_max)` which for patterns
+    # of length ~200 meant 200 Python iterations × 3-4 GPU kernel launches
+    # each = ~600-800 kernel launches. Now replaced with two vectorized
+    # scatter operations (constants + variables).
     output = torch.zeros(B, max_output_len, dtype=torch.int32, device=device)
     step_base = torch.arange(B, device=device, dtype=torch.long) * max_output_len
     output_flat = output.view(-1)
 
-    s_range = torch.arange(S_max, device=device, dtype=torch.int32).unsqueeze(0)
     actual_P_max = int(pattern_lengths.max().item())
+    # Trim to actual width
+    pat_valid_a = pat_valid[:, :actual_P_max]
+    has_var_a = has_var[:, :actual_P_max]
+    offsets_a = offsets[:, :actual_P_max]
+    patterns_a = patterns[:, :actual_P_max]
+    var_idx_a = var_idx[:, :actual_P_max]
+    token_lengths_a = token_lengths[:, :actual_P_max]
 
-    for p in range(actual_P_max):
-        p_valid = pat_valid[:, p]
-        if not p_valid.any():
-            continue
-        off_p = offsets[:, p]
-        is_var_p = has_var[:, p] & p_valid
-        is_const_p = ~has_var[:, p] & p_valid
+    # (a) Constants: one token per position — single vectorized scatter.
+    const_mask = ~has_var_a & pat_valid_a  # [B, actual_P_max]
+    if const_mask.any():
+        const_flat_idx = (step_base.unsqueeze(1) + offsets_a.long())[const_mask]
+        output_flat[const_flat_idx] = patterns_a[const_mask]
 
-        # Constants: write single token directly
-        if is_const_p.any():
-            flat_pos_c = (step_base + off_p.long())[is_const_p]
-            output_flat[flat_pos_c] = patterns[:, p][is_const_p]
+    # (b) Variables: multi-token scatter — single vectorized operation.
+    var_mask = has_var_a & pat_valid_a  # [B, actual_P_max]
+    if var_mask.any():
+        var_b, var_p = torch.where(var_mask)  # [num_vars] each
+        var_match_f = var_idx_a[var_b, var_p]  # which fhyp
+        var_lens = token_lengths_a[var_b, var_p]  # replacement lengths
+        var_offs = offsets_a[var_b, var_p]  # output offsets
 
-        # Variables: write replacement token sequence
-        if is_var_p.any():
-            tl_p = token_lengths[:, p]
-            match_f = var_idx[:, p]
-            b_idx = torch.arange(B, device=device)
-            rep_toks = var_sub_values[b_idx, match_f]  # [B, S_max]
-
-            s_valid = (s_range < tl_p.unsqueeze(1)) & is_var_p.unsqueeze(1)
-            flat_pos = step_base.unsqueeze(1) + off_p.unsqueeze(1).long() + s_range.long()
+        var_max_len = int(var_lens.max().item())
+        if var_max_len > 0:
+            s_range_v = torch.arange(var_max_len, device=device)
+            s_valid = s_range_v.unsqueeze(0) < var_lens.unsqueeze(1)  # [num_vars, var_max_len]
+            flat_var_idx = (step_base[var_b].unsqueeze(1)
+                           + var_offs.unsqueeze(1).long()
+                           + s_range_v.long().unsqueeze(0))
+            flat_var_vals = var_sub_values[var_b, var_match_f, :var_max_len]
 
             s_valid_flat = s_valid.reshape(-1)
             if s_valid_flat.any():
-                output_flat[flat_pos.reshape(-1)[s_valid_flat]] = \
-                    rep_toks.reshape(-1)[s_valid_flat]
+                output_flat[flat_var_idx.reshape(-1)[s_valid_flat]] = \
+                    flat_var_vals.reshape(-1)[s_valid_flat]
 
     return output, total_lengths
 
@@ -1102,6 +1119,13 @@ def _execute_level(
             idxs = np.where(node_levels_np == lv)[0]
             sublevel_ranges.append((int(idxs[0]), int(idxs[-1]) + 1))
 
+    # Pre-clamp input indices once for the entire batch instead of per-chunk.
+    # Input indices use -1 as padding sentinel; clamping to 0 makes gathers safe.
+    safe_input_global_t = input_global_t.clamp(min=0)
+    # Pre-clamp fhyp/ehyp positions
+    safe_fhyp_pos_t = fhyp_pos_t.clamp(min=0, max=max_inputs - 1)
+    safe_ehyp_pos_t = ehyp_pos_t.clamp(min=0, max=max_inputs - 1)
+
     for sl_start, sl_end in sublevel_ranges:
         sl_size = sl_end - sl_start
 
@@ -1113,19 +1137,16 @@ def _execute_level(
 
             c_pat         = pattern_toks_t[cs]
             c_pat_len     = pattern_lengths_t[cs]
-            c_in_idx      = input_global_t[cs]
             c_in_count    = input_counts_t[cs]
-            c_fhyp_pos    = fhyp_pos_t[cs]
             c_fhyp_var    = fhyp_var_t[cs]
             c_fhyp_count  = fhyp_count_t[cs]
-            c_ehyp_pos    = ehyp_pos_t[cs]
             c_ehyp_pats   = ehyp_pats_t[cs]
             c_ehyp_pat_lens = ehyp_pat_lens_t[cs]
             c_ehyp_count  = ehyp_count_t[cs]
             c_out_idx     = output_global_t[cs]
 
             # ── (a) Gather inputs ─────────────────────────────────────
-            safe_in_idx   = c_in_idx.clamp(min=0)
+            safe_in_idx   = safe_input_global_t[cs]
             inputs        = expr_buffer[safe_in_idx]       # [cB, max_inputs, max_expr_len]
             input_lens    = expr_lengths[safe_in_idx]      # [cB, max_inputs]
             input_failed  = node_failed[safe_in_idx]       # [cB, max_inputs]
@@ -1139,7 +1160,7 @@ def _execute_level(
             #   var_sub_lengths: [cB, max_fhyps]
             # Memory: cB × max_fhyps × S_max × 4 ≈ 40 MB vs multi-GB.
             fhyp_valid    = torch.arange(max_fhyps, device=device) < c_fhyp_count.unsqueeze(1)
-            safe_fhyp_pos = c_fhyp_pos.clamp(min=0, max=max_inputs - 1)
+            safe_fhyp_pos = safe_fhyp_pos_t[cs]
             batch_range   = torch.arange(cB, device=device).unsqueeze(1).expand(cB, max_fhyps)
             fhyp_input_exprs = inputs[batch_range, safe_fhyp_pos]   # [cB, max_fhyps, max_expr_len]
             fhyp_input_lens  = input_lens[batch_range, safe_fhyp_pos]
@@ -1151,25 +1172,53 @@ def _execute_level(
             var_sub_values = var_sub_values[:, :, :S_max]
 
             # ── (c) Check essential hypotheses ────────────────────────
+            # Batch ALL ehyps into a single substitution call instead of
+            # looping `for e in range(max_ehyps_val)`. This eliminates
+            # max_ehyps separate calls to _apply_substitution_compact
+            # (typically 2-10 calls), each with Python + GPU kernel overhead.
             max_ehyps_val = int(c_ehyp_count.max().item()) if cB > 0 else 0
-            ehyp_results  = torch.ones(cB, max_ehyps, dtype=torch.bool, device=device)
-            arange_cB     = torch.arange(cB, device=device)
+            if max_ehyps_val == 0:
+                all_ehyps_ok = torch.ones(cB, dtype=torch.bool, device=device)
+            else:
+                E = max_ehyps_val
+                arange_cB = torch.arange(cB, device=device)
 
-            for e in range(max_ehyps_val):
-                ehyp_pat        = c_ehyp_pats[:, e, :]
-                ehyp_pat_len    = c_ehyp_pat_lens[:, e]
-                safe_ep         = c_ehyp_pos[:, e].clamp(min=0, max=max_inputs - 1)
-                ehyp_target     = inputs[arange_cB, safe_ep]
-                ehyp_target_len = input_lens[arange_cB, safe_ep]
-                ehyp_out, ehyp_out_len = _apply_substitution_compact(
-                    ehyp_pat, ehyp_pat_len,
-                    c_fhyp_var, var_sub_values, var_sub_lengths, fhyp_valid,
+                # Stack all ehyps: [cB, E, ehyp_P] → [cB*E, ehyp_P]
+                ehyp_pats_flat = c_ehyp_pats[:, :E, :].reshape(cB * E, -1)
+                ehyp_plens_flat = c_ehyp_pat_lens[:, :E].reshape(cB * E)
+
+                # Replicate var data for all ehyps: [cB, F, S] → [cB*E, F, S]
+                var_ids_rep = c_fhyp_var.unsqueeze(1).expand(cB, E, max_fhyps).reshape(cB * E, max_fhyps)
+                var_vals_rep = var_sub_values.unsqueeze(1).expand(cB, E, max_fhyps, S_max).reshape(cB * E, max_fhyps, S_max)
+                var_lens_rep = var_sub_lengths.unsqueeze(1).expand(cB, E, max_fhyps).reshape(cB * E, max_fhyps)
+                fhyp_valid_rep = fhyp_valid.unsqueeze(1).expand(cB, E, max_fhyps).reshape(cB * E, max_fhyps)
+
+                # Single batched substitution call
+                ehyp_out_flat, ehyp_out_len_flat = _apply_substitution_compact(
+                    ehyp_pats_flat, ehyp_plens_flat,
+                    var_ids_rep, var_vals_rep, var_lens_rep, fhyp_valid_rep,
                     device,
                 )
-                ehyp_results[:, e] = _verify_substitution_result(ehyp_out, ehyp_out_len, ehyp_target, ehyp_target_len, device)
 
-            ehyp_valid_mask = torch.arange(max_ehyps, device=device) < c_ehyp_count.unsqueeze(1)
-            all_ehyps_ok    = (ehyp_results | ~ehyp_valid_mask).all(dim=1)
+                # Gather targets for all ehyps at once
+                safe_ep = safe_ehyp_pos_t[cs][:, :E]  # [cB, E]
+                b_range_E = arange_cB.unsqueeze(1).expand(cB, E)
+                ehyp_targets = inputs[b_range_E, safe_ep]  # [cB, E, max_expr_len]
+                ehyp_target_lens = input_lens[b_range_E, safe_ep]  # [cB, E]
+                ehyp_targets_flat = ehyp_targets.reshape(cB * E, -1)
+                ehyp_target_lens_flat = ehyp_target_lens.reshape(cB * E)
+
+                # Single batched verification
+                ehyp_match_flat = _verify_substitution_result(
+                    ehyp_out_flat, ehyp_out_len_flat,
+                    ehyp_targets_flat, ehyp_target_lens_flat,
+                    device,
+                )
+
+                # Reshape and mask invalid ehyps
+                ehyp_results = ehyp_match_flat.reshape(cB, E)
+                ehyp_valid_mask = torch.arange(E, device=device) < c_ehyp_count.unsqueeze(1)
+                all_ehyps_ok = (ehyp_results | ~ehyp_valid_mask).all(dim=1)
 
             # ── (d) Compute conclusion ────────────────────────────────
             concl_output, concl_out_len = _apply_substitution_compact(
@@ -1336,19 +1385,22 @@ def _run_gpu_pipeline(
     # For final expressions longer than max_expr_len: compare rolling hashes.
     fits_in_buffer = final_lens <= max_expr_len
 
+    # Compare final expressions without padding allocation.
+    # Use the narrower width and only compare within valid positions.
     final_exprs = expr_buffer[final_idx_t]  # [num_proofs, max_expr_len]
     w1 = final_exprs.shape[1]
     w2 = expected.shape[1]
-    if w1 < w2:
-        final_exprs = torch.nn.functional.pad(final_exprs, (0, w2 - w1))
-    elif w2 < w1:
-        expected = torch.nn.functional.pad(expected, (0, w1 - w2))
-
-    compare_dim = max(w1, w2)
+    compare_dim = min(w1, w2)
+    # Lengths that exceed compare_dim can't match via tokens — they'll
+    # use hash comparison via fits_in_buffer check below.
     positions   = torch.arange(compare_dim, device=device).unsqueeze(0)
     valid_mask  = positions < final_lens.unsqueeze(1)
-    masked_eq   = (final_exprs == expected) | ~valid_mask
+    masked_eq   = (final_exprs[:, :compare_dim] == expected[:, :compare_dim]) | ~valid_mask
     token_match = masked_eq.all(dim=1)
+    # Any proof with length > compare_dim can't be token-compared correctly,
+    # so force it to hash comparison path.
+    if compare_dim < max(w1, w2):
+        token_match = token_match & (final_lens <= compare_dim)
 
     hash_match = (final_hashes == expected_hashes)
     content_match = torch.where(fits_in_buffer, token_match, hash_match)
@@ -1478,6 +1530,28 @@ def verify_proofs_gpu(
 # ══════════════════════════════════════════════════════════════════════
 
 
+_DV_WORKER_PARSED: ParsedDatabase | None = None
+
+
+def _init_dv_worker(parsed: ParsedDatabase) -> None:
+    global _DV_WORKER_PARSED
+    _DV_WORKER_PARSED = parsed
+
+
+def _check_dv_chunk(labels: list[str]) -> dict[str, bool]:
+    from tensormm.cpu_verifier import CPUVerifier
+    assert _DV_WORKER_PARSED is not None
+    cpu_v = CPUVerifier(_DV_WORKER_PARSED)
+    results = {}
+    for lbl in labels:
+        try:
+            r = cpu_v.verify_proof(lbl)
+            results[lbl] = r.success
+        except Exception:
+            results[lbl] = False
+    return results
+
+
 def _check_dv_constraints(
     parsed: ParsedDatabase,
     graphs: list[ProofGraph],
@@ -1487,23 +1561,48 @@ def _check_dv_constraints(
 
     Uses the existing CPUVerifier which already handles $d checking
     efficiently. Only checks proofs that the GPU said passed.
+    Runs in parallel across available CPU cores.
 
     Returns updated proof_passed array.
     """
-    from tensormm.cpu_verifier import CPUVerifier
-
     result = proof_passed.copy()
-    cpu_v = CPUVerifier(parsed)
+    # Collect only labels that passed GPU verification
+    labels_to_check = [
+        g.theorem_label for pi, g in enumerate(graphs) if result[pi]
+    ]
+    if not labels_to_check:
+        return result
 
-    for pi, g in enumerate(graphs):
-        if not result[pi]:
-            continue  # already failed on GPU
-        try:
-            r = cpu_v.verify_proof(g.theorem_label)
-            if not r.success:
-                result[pi] = False
-        except Exception:
-            result[pi] = False
+    workers = min(os.cpu_count() or 1, 32)
+    chunk_size = max(1, len(labels_to_check) // (workers * 4))
+    chunks = [
+        labels_to_check[i: i + chunk_size]
+        for i in range(0, len(labels_to_check), chunk_size)
+    ]
+
+    global _DV_WORKER_PARSED
+    if sys.platform == "linux":
+        _DV_WORKER_PARSED = parsed
+        ctx = multiprocessing.get_context("fork")
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+    else:
+        pool = ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_init_dv_worker,
+            initargs=(parsed,),
+        )
+
+    dv_results: dict[str, bool] = {}
+    with pool as executor:
+        futures = {executor.submit(_check_dv_chunk, chunk): chunk for chunk in chunks}
+        for future in as_completed(futures):
+            dv_results.update(future.result())
+
+    # Update result array
+    label_to_pi = {g.theorem_label: pi for pi, g in enumerate(graphs)}
+    for lbl, passed in dv_results.items():
+        if not passed:
+            result[label_to_pi[lbl]] = False
 
     return result
 
