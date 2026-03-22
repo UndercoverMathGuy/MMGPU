@@ -224,7 +224,7 @@ def build_proof_graph(
 
 _GRAPH_WORKER_PARSED: ParsedDatabase | None = None
 _GRAPH_WORKER_LABEL_INFO: dict[str, tuple[str, object]] | None = None
-_MAX_GRAPH_WORKERS = 32
+_MAX_GRAPH_WORKERS = 512  # no artificial cap — use all available cores
 
 
 def _init_graph_worker(parsed: ParsedDatabase) -> None:
@@ -244,13 +244,18 @@ def build_all_proof_graphs(
     parsed: ParsedDatabase,
     theorem_labels: list[str],
     max_workers: int | None = None,
+    verbose: bool = False,
 ) -> tuple[list[ProofGraph], list[str]]:
     """Build proof graphs for all theorems in parallel."""
     if not theorem_labels:
         return [], []
 
     workers = min(max_workers or os.cpu_count() or 1, _MAX_GRAPH_WORKERS)
-    chunk_size = max(1, (len(theorem_labels) + workers - 1) // workers)
+
+    # Smaller chunks so workers drain incrementally and RAM doesn't spike
+    # from all workers holding a full chunk in memory simultaneously.
+    # Target ~4 chunks per worker so the pool stays saturated.
+    chunk_size = max(1, len(theorem_labels) // (workers * 4))
     chunks = [
         theorem_labels[i: i + chunk_size]
         for i in range(0, len(theorem_labels), chunk_size)
@@ -258,21 +263,35 @@ def build_all_proof_graphs(
 
     global _GRAPH_WORKER_PARSED, _GRAPH_WORKER_LABEL_INFO
     if sys.platform == "linux":
+        # Build label_info once on main process; workers inherit via fork
+        # (copy-on-write — no per-worker rebuild cost).
+        if verbose:
+            print(f"  Graph construction: building label_info...", flush=True)
         _GRAPH_WORKER_PARSED = parsed
         _GRAPH_WORKER_LABEL_INFO = _build_label_info(parsed)
         ctx = multiprocessing.get_context("fork")
         pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
     else:
+        # spawn/forkserver: each worker calls _init_graph_worker once,
+        # which builds label_info inside the worker (no serialisation of it).
         pool = ProcessPoolExecutor(
             max_workers=workers,
             initializer=_init_graph_worker,
             initargs=(parsed,),
         )
 
+    if verbose:
+        print(
+            f"  Graph construction: {len(theorem_labels):,} theorems, "
+            f"{workers} workers, {len(chunks)} chunks of ~{chunk_size}",
+            flush=True,
+        )
+
     graphs: list[ProofGraph] = []
     errors: list[str] = []
-
     ordered: list[list[ProofGraph | str]] = [None] * len(chunks)  # type: ignore
+    done = 0
+
     with pool as executor:
         future_to_idx = {
             executor.submit(_build_graphs_chunk, chunk): idx
@@ -281,6 +300,10 @@ def build_all_proof_graphs(
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             ordered[idx] = future.result()
+            done += len(ordered[idx])
+            if verbose and done % max(1, len(theorem_labels) // 10) < chunk_size:
+                pct = 100 * done / len(theorem_labels)
+                print(f"  Graph construction: {done:,}/{len(theorem_labels):,} ({pct:.0f}%)", flush=True)
 
     for chunk_results in ordered:
         for result in chunk_results:
@@ -373,31 +396,48 @@ def pack_levels(
     parsed: ParsedDatabase,
     tokenizer: Tokenizer,
 ) -> GlobalPlan:
-    """Pack all proof graphs into level-indexed GPU-ready tensors."""
+    """Pack all proof graphs into level-indexed GPU-ready tensors.
+
+    Optimised for many-core machines (Xeon/EPYC):
+    - Token encoding is done once per unique expression into a shared cache
+      so repeated axioms (ax-mp appears in thousands of proofs) are encoded
+      exactly once rather than once per node.
+    - Per-level array filling is parallelised across a ThreadPoolExecutor.
+      numpy array writes release the GIL so threads genuinely run in parallel
+      across cores without fork overhead.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
     label_info = _build_label_info(parsed)
 
     # ── Assign global buffer indices ─────────────────────────────────
-    # Each proof's nodes get contiguous global indices.
-    # Backrefs (Z-reuse) can point to a node that already has a global index,
-    # which is fine — multiple reads from the same expr_buffer slot.
     total_nodes = 0
-    # (proof_idx, local_step_idx) -> global_idx
     global_idx_map: dict[tuple[int, int], int] = {}
     for pi, g in enumerate(graphs):
         for node in g.nodes:
             global_idx_map[(pi, node.step_idx)] = total_nodes
             total_nodes += 1
 
+    # ── Pre-encode every unique expression once ───────────────────────
+    # For set.mm, ax-mp appears in ~30k proofs. Without caching,
+    # tokenizer.encode_expression(ax-mp.expression) is called 30k times.
+    # With caching it's called once.
+    _enc_cache: dict[tuple[str, ...], list[int]] = {}
+
+    def _enc(expr: list[str]) -> list[int]:
+        key = tuple(expr)
+        if key not in _enc_cache:
+            _enc_cache[key] = tokenizer.encode_expression(expr)
+        return _enc_cache[key]
+
     # ── Compute max_expr_len from actual data ────────────────────────
-    # Scan all push expressions, assertion conclusions, essential hyp patterns
-    max_expr_len = 512  # floor
+    max_expr_len = 512
     for g in graphs:
         for node in g.nodes:
             if node.expression is not None:
                 max_expr_len = max(max_expr_len, len(node.expression))
         max_expr_len = max(max_expr_len, len(g.expected_conclusion))
-    # Scan all assertion conclusions and essential hyp expressions
-    for lbl, info in label_info.items():
+    for _, info in label_info.items():
         if info[0] in ("$a", "$p"):
             a = info[1]
             max_expr_len = max(max_expr_len, len(a.expression))
@@ -406,8 +446,7 @@ def pack_levels(
                 max_expr_len = max(max_expr_len, len(eh.expression))
 
     # ── Collect nodes by level ───────────────────────────────────────
-    push_nodes: list[tuple[int, ProofNode]] = []   # (proof_idx, node)
-    # level -> list of (proof_idx, node)
+    push_nodes: list[tuple[int, ProofNode]] = []
     assertion_nodes_by_level: dict[int, list[tuple[int, ProofNode]]] = {}
 
     for pi, g in enumerate(graphs):
@@ -420,120 +459,95 @@ def pack_levels(
                     assertion_nodes_by_level[lvl] = []
                 assertion_nodes_by_level[lvl].append((pi, node))
 
-    # ── Pack push nodes (level 0) ────────────────────────────────────
+    # ── Pack push nodes ──────────────────────────────────────────────
     n_push = len(push_nodes)
     push_global_indices = np.zeros(n_push, dtype=np.int32)
     push_expressions = np.zeros((n_push, max_expr_len), dtype=np.int32)
     push_expr_lengths = np.zeros(n_push, dtype=np.int32)
 
     for i, (pi, node) in enumerate(push_nodes):
-        gidx = global_idx_map[(pi, node.step_idx)]
-        push_global_indices[i] = gidx
-        expr = node.expression
-        assert expr is not None
-        encoded = tokenizer.encode_expression(expr)
+        push_global_indices[i] = global_idx_map[(pi, node.step_idx)]
+        assert node.expression is not None
+        encoded = _enc(node.expression)
         push_expr_lengths[i] = len(encoded)
-        for j, tok in enumerate(encoded):
-            push_expressions[i, j] = tok
+        push_expressions[i, :len(encoded)] = encoded
 
-    # ── Pack assertion levels ────────────────────────────────────────
-    assertion_batches: list[AssertionLevelBatch] = []
+    # ── Pack assertion levels (parallel) ────────────────────────────
     sorted_levels = sorted(assertion_nodes_by_level.keys())
 
-    for lvl in sorted_levels:
+    def _pack_one_level(lvl: int) -> AssertionLevelBatch:
         nodes_at_level = assertion_nodes_by_level[lvl]
         B = len(nodes_at_level)
 
-        # Determine max dimensions for this level
-        max_inputs = 0
-        max_fhyps = 0
-        max_ehyps = 0
-        max_ehyp_len = 0
-        max_pat_len = 0
-
+        max_inputs = max_fhyps = max_ehyps = max_ehyp_len = max_pat_len = 0
         for pi, node in nodes_at_level:
-            _, data = label_info[node.label]
-            a = data
+            a = label_info[node.label][1]
             n_f = len(a.floating_hyps)
             n_e = len(a.essential_hyps)
-            n_in = n_f + n_e
-            max_inputs = max(max_inputs, n_in)
-            max_fhyps = max(max_fhyps, n_f)
-            max_ehyps = max(max_ehyps, n_e)
-            max_pat_len = max(max_pat_len, len(a.expression))
+            max_inputs  = max(max_inputs,  n_f + n_e)
+            max_fhyps   = max(max_fhyps,   n_f)
+            max_ehyps   = max(max_ehyps,   n_e)
+            max_pat_len = max(max_pat_len,  len(a.expression))
             for elbl in a.essential_hyps:
-                eh = parsed.essential_hyps[elbl]
-                max_ehyp_len = max(max_ehyp_len, len(eh.expression))
+                max_ehyp_len = max(max_ehyp_len, len(parsed.essential_hyps[elbl].expression))
 
-        # Ensure minimums
-        max_inputs = max(max_inputs, 1)
-        max_fhyps = max(max_fhyps, 1)
-        max_ehyps = max(max_ehyps, 1)
+        max_inputs   = max(max_inputs,   1)
+        max_fhyps    = max(max_fhyps,    1)
+        max_ehyps    = max(max_ehyps,    1)
         max_ehyp_len = max(max_ehyp_len, 1)
-        max_pat_len = max(max_pat_len, 1)
+        max_pat_len  = max(max_pat_len,  1)
 
-        # Allocate arrays
         assertion_labels_list: list[str] = []
-        theorem_labels_list: list[str] = []
-        pattern_toks = np.zeros((B, max_pat_len), dtype=np.int32)
-        pattern_lengths = np.zeros(B, dtype=np.int32)
-        input_global_indices = np.full((B, max_inputs), -1, dtype=np.int32)
-        input_counts = np.zeros(B, dtype=np.int32)
-        fhyp_input_positions = np.zeros((B, max_fhyps), dtype=np.int32)
-        fhyp_var_ids = np.zeros((B, max_fhyps), dtype=np.int32)
-        fhyp_count = np.zeros(B, dtype=np.int32)
-        ehyp_input_positions = np.zeros((B, max_ehyps), dtype=np.int32)
-        ehyp_patterns = np.zeros((B, max_ehyps, max_ehyp_len), dtype=np.int32)
-        ehyp_pattern_lengths = np.zeros((B, max_ehyps), dtype=np.int32)
-        ehyp_count = np.zeros(B, dtype=np.int32)
-        output_global_indices = np.zeros(B, dtype=np.int32)
+        theorem_labels_list:   list[str] = []
+        pattern_toks          = np.zeros((B, max_pat_len),                   dtype=np.int32)
+        pattern_lengths       = np.zeros(B,                                  dtype=np.int32)
+        input_global_indices  = np.full( (B, max_inputs), -1,                dtype=np.int32)
+        input_counts          = np.zeros(B,                                  dtype=np.int32)
+        fhyp_input_positions  = np.zeros((B, max_fhyps),                    dtype=np.int32)
+        fhyp_var_ids          = np.zeros((B, max_fhyps),                    dtype=np.int32)
+        fhyp_count            = np.zeros(B,                                  dtype=np.int32)
+        ehyp_input_positions  = np.zeros((B, max_ehyps),                    dtype=np.int32)
+        ehyp_patterns         = np.zeros((B, max_ehyps, max_ehyp_len),      dtype=np.int32)
+        ehyp_pattern_lengths  = np.zeros((B, max_ehyps),                    dtype=np.int32)
+        ehyp_count            = np.zeros(B,                                  dtype=np.int32)
+        output_global_indices = np.zeros(B,                                  dtype=np.int32)
 
         for b, (pi, node) in enumerate(nodes_at_level):
-            _, data = label_info[node.label]
-            a = data
+            a = label_info[node.label][1]
             assertion_labels_list.append(node.label)
             theorem_labels_list.append(graphs[pi].theorem_label)
 
-            # Pattern
-            pat_enc = tokenizer.encode_expression(a.expression)
+            pat_enc = _enc(a.expression)
             pattern_lengths[b] = len(pat_enc)
-            for j, tok in enumerate(pat_enc):
-                pattern_toks[b, j] = tok
+            pattern_toks[b, :len(pat_enc)] = pat_enc
 
-            # Input global indices (floating hyps first, then essential hyps)
             n_f = len(a.floating_hyps)
             n_e = len(a.essential_hyps)
             input_counts[b] = n_f + n_e
             for k, si in enumerate(node.input_steps):
                 input_global_indices[b, k] = global_idx_map[(pi, si)]
 
-            # Floating hyp metadata
             fhyp_count[b] = n_f
             for f_idx, flbl in enumerate(a.floating_hyps):
                 fh = parsed.floating_hyps[flbl]
-                fhyp_input_positions[b, f_idx] = f_idx  # first n_f inputs
+                fhyp_input_positions[b, f_idx] = f_idx
                 fhyp_var_ids[b, f_idx] = tokenizer.encode_symbol(fh.variable)
 
-            # Essential hyp metadata
             ehyp_count[b] = n_e
             for e_idx, elbl in enumerate(a.essential_hyps):
                 eh = parsed.essential_hyps[elbl]
                 ehyp_input_positions[b, e_idx] = n_f + e_idx
-                enc = tokenizer.encode_expression(eh.expression)
+                enc = _enc(eh.expression)
                 ehyp_pattern_lengths[b, e_idx] = len(enc)
-                for j, tok in enumerate(enc):
-                    ehyp_patterns[b, e_idx, j] = tok
+                ehyp_patterns[b, e_idx, :len(enc)] = enc
 
-            # Output
             output_global_indices[b] = global_idx_map[(pi, node.step_idx)]
 
-        node_levels_arr = np.full(B, lvl, dtype=np.int32)
-
-        assertion_batches.append(AssertionLevelBatch(
+        return AssertionLevelBatch(
             level=lvl,
             max_level=lvl,
             count=B,
-            node_levels=node_levels_arr,
+            node_levels=np.full(B, lvl, dtype=np.int32),
             assertion_labels=assertion_labels_list,
             theorem_labels=theorem_labels_list,
             pattern_toks=pattern_toks,
@@ -548,25 +562,30 @@ def pack_levels(
             ehyp_pattern_lengths=ehyp_pattern_lengths,
             ehyp_count=ehyp_count,
             output_global_indices=output_global_indices,
-        ))
+        )
+
+    pack_workers = min(os.cpu_count() or 1, len(sorted_levels))
+    if pack_workers > 1:
+        with ThreadPoolExecutor(max_workers=pack_workers) as tex:
+            assertion_batches = list(tex.map(_pack_one_level, sorted_levels))
+    else:
+        assertion_batches = [_pack_one_level(lvl) for lvl in sorted_levels]
 
     # ── Final check data ─────────────────────────────────────────────
     num_proofs = len(graphs)
     max_concl_len = max((len(g.expected_conclusion) for g in graphs), default=1)
-    final_node_indices = np.zeros(num_proofs, dtype=np.int32)
-    expected_conclusions = np.zeros((num_proofs, max_concl_len), dtype=np.int32)
-    conclusion_lengths = np.zeros(num_proofs, dtype=np.int32)
+    final_node_indices    = np.zeros(num_proofs,              dtype=np.int32)
+    expected_conclusions  = np.zeros((num_proofs, max_concl_len), dtype=np.int32)
+    conclusion_lengths    = np.zeros(num_proofs,              dtype=np.int32)
     proof_theorem_labels: list[str] = []
 
     for pi, g in enumerate(graphs):
         proof_theorem_labels.append(g.theorem_label)
-        # Last node in the graph is the final proof step
         last_node = g.nodes[-1]
         final_node_indices[pi] = global_idx_map[(pi, last_node.step_idx)]
-        enc = tokenizer.encode_expression(g.expected_conclusion)
+        enc = _enc(g.expected_conclusion)
         conclusion_lengths[pi] = len(enc)
-        for j, tok in enumerate(enc):
-            expected_conclusions[pi, j] = tok
+        expected_conclusions[pi, :len(enc)] = enc
 
     return GlobalPlan(
         total_nodes=total_nodes,
@@ -1431,7 +1450,7 @@ def verify_database(
 
     # ── Phase 1: Graph construction ──────────────────────────────
     t0 = time.perf_counter()
-    graphs, graph_errors = build_all_proof_graphs(parsed, theorem_labels)
+    graphs, graph_errors = build_all_proof_graphs(parsed, theorem_labels, verbose=verbose)
     t_graph = time.perf_counter() - t0
     if verbose:
         print(

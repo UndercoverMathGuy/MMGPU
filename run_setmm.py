@@ -72,6 +72,7 @@ print(f"[set.mm FULL {backend}] Verifying {len(theorems):,} theorems "
 print(f"  Backend: {backend}")
 print()
 
+print(f"[set.mm FULL] Starting GPU verification pipeline...", flush=True)
 t_total_0 = time.perf_counter()
 gpu_results = verify_database(parsed, theorems, device=device, verbose=True)
 t_total = time.perf_counter() - t_total_0
