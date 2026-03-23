@@ -26,7 +26,7 @@ WORKDIR /app
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu126 \
     && python3 -m pip install --break-system-packages --no-cache-dir \
-    numpy pytest
+    numpy pytest ninja
 
 # Download set.mm from Metamath GitHub
 RUN mkdir -p data \
