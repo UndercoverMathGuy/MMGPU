@@ -29,6 +29,7 @@ import torch
 
 from tensormm.parser import ParsedDatabase
 from tensormm.tokenizer import Tokenizer
+from tensormm import cuda_kernels as _cuda_mod
 
 # ══════════════════════════════════════════════════════════════════════
 #  Phase 1 — Graph Construction (CPU, O(n))
@@ -1258,6 +1259,128 @@ def _execute_level(
     return
 
 
+def _run_gpu_pipeline_cuda(
+    plan: GlobalPlan,
+    device: torch.device,
+    max_expr_len: int,
+    verbose: bool = False,
+) -> tuple[np.ndarray, bool, int]:
+    """CUDA kernel path — zero intermediate GPU allocations.
+
+    Same semantics as _run_gpu_pipeline but uses custom CUDA kernels that
+    stream-substitute in registers instead of materializing intermediate
+    tensors. Memory = expr_buffer + tracking arrays + assertion table.
+
+    Returns:
+        (per_proof_passed, had_intermediate_truncation, max_intermediate_len)
+    """
+    total_nodes = plan.total_nodes
+
+    if total_nodes == 0:
+        return np.ones(plan.num_proofs, dtype=np.bool_), False, 0
+
+    # ── Allocate GPU buffers (the ONLY large allocations) ─────────
+    expr_buffer  = torch.empty(total_nodes, max_expr_len, dtype=torch.int32, device=device)
+    expr_lengths = torch.zeros(total_nodes, dtype=torch.int32, device=device)
+    expr_hashes  = torch.zeros(total_nodes, dtype=torch.int64, device=device)
+    node_failed  = torch.zeros(total_nodes, dtype=torch.bool,  device=device)
+
+    # ── Level 0: push nodes via CUDA kernel ───────────────────────
+    if len(plan.push_global_indices) > 0:
+        _cuda_mod.cuda_push_nodes(
+            plan.push_global_indices,
+            plan.push_expressions,
+            plan.push_expr_lengths,
+            expr_buffer, expr_lengths, expr_hashes,
+            device,
+        )
+        torch.cuda.synchronize(device)
+
+    if verbose:
+        print(f"    Level 0: {len(plan.push_global_indices)} push nodes written (CUDA)")
+
+    # ── Upload assertion table once ───────────────────────────────
+    tbl = plan.assertion_table
+    tbl_pattern_toks_t         = torch.from_numpy(tbl.pattern_toks).to(device)
+    tbl_pattern_lengths_t      = torch.from_numpy(tbl.pattern_lengths).to(device)
+    tbl_fhyp_var_ids_t         = torch.from_numpy(tbl.fhyp_var_ids).to(device)
+    tbl_fhyp_count_t           = torch.from_numpy(tbl.fhyp_count).to(device)
+    tbl_ehyp_patterns_t        = torch.from_numpy(tbl.ehyp_patterns).to(device)
+    tbl_ehyp_pattern_lengths_t = torch.from_numpy(tbl.ehyp_pattern_lengths).to(device)
+    tbl_ehyp_count_t           = torch.from_numpy(tbl.ehyp_count).to(device)
+    torch.cuda.synchronize(device)
+
+    if verbose:
+        print(f"    Assertion table uploaded: {len(tbl.assertion_labels)} unique assertions (CUDA)", flush=True)
+
+    # ── Levels 1..max: assertion nodes via CUDA kernel ────────────
+    effective_batches = _merge_sparse_levels(plan.assertion_batches)
+    if verbose:
+        orig_n = len(plan.assertion_batches)
+        merged_n = len(effective_batches)
+        if merged_n < orig_n:
+            print(f"    Level coalescing: {orig_n} → {merged_n} batches", flush=True)
+
+    for batch in effective_batches:
+        t_lvl = time.perf_counter()
+
+        # Compute sublevel ranges
+        if batch.sublevel_ranges is not None:
+            sublevel_ranges = batch.sublevel_ranges
+        elif batch.level == batch.max_level:
+            sublevel_ranges = [(0, batch.count)]
+        else:
+            node_levels_np = batch.node_levels
+            unique_lvls = np.unique(node_levels_np)
+            sublevel_ranges = []
+            for lv in unique_lvls:
+                idxs = np.where(node_levels_np == lv)[0]
+                sublevel_ranges.append((int(idxs[0]), int(idxs[-1]) + 1))
+
+        _cuda_mod.cuda_execute_level(
+            batch.assertion_idx,
+            batch.input_global_indices,
+            batch.input_counts,
+            batch.fhyp_input_positions,
+            batch.ehyp_input_positions,
+            batch.output_global_indices,
+            sublevel_ranges,
+            tbl_pattern_toks_t, tbl_pattern_lengths_t,
+            tbl_fhyp_var_ids_t, tbl_fhyp_count_t,
+            tbl_ehyp_patterns_t, tbl_ehyp_pattern_lengths_t, tbl_ehyp_count_t,
+            expr_buffer, expr_lengths, expr_hashes, node_failed,
+            device,
+        )
+
+        if verbose:
+            dt = time.perf_counter() - t_lvl
+            lvl_str = (
+                f"{batch.level}" if batch.level == batch.max_level
+                else f"{batch.level}-{batch.max_level}"
+            )
+            print(f"    Level {lvl_str}: {batch.count} nodes in {dt:.3f}s (CUDA)", flush=True)
+
+    # ── Check for intermediate truncation ────────────────────────────
+    final_mask = torch.zeros(plan.total_nodes, dtype=torch.bool, device=device)
+    final_idx_t = torch.from_numpy(plan.final_node_indices).long().to(device)
+    final_mask[final_idx_t] = True
+    intermediate_lens = expr_lengths.masked_fill(final_mask, 0)
+    max_intermediate = int(intermediate_lens.max().item())
+    had_intermediate_truncation = max_intermediate > max_expr_len
+
+    # ── Final check via CUDA kernel ──────────────────────────────────
+    proof_passed_np = _cuda_mod.cuda_final_check(
+        plan.final_node_indices,
+        plan.expected_conclusions,
+        plan.conclusion_lengths,
+        plan.expected_conclusion_hashes,
+        expr_buffer, expr_lengths, expr_hashes, node_failed,
+        device,
+    )
+
+    return proof_passed_np, had_intermediate_truncation, max_intermediate
+
+
 def _run_gpu_pipeline(
     plan: GlobalPlan,
     device: torch.device,
@@ -1265,6 +1388,9 @@ def _run_gpu_pipeline(
     verbose: bool = False,
 ) -> tuple[np.ndarray, bool, int]:
     """Single run of the GPU pipeline with a given max_expr_len.
+
+    Dispatches to custom CUDA kernels when available (zero intermediate
+    memory), otherwise falls back to the PyTorch tensor-op path.
 
     Intermediate expressions that exceed max_expr_len are stored truncated —
     this corrupts downstream substitutions, so the caller must retry with a
@@ -1276,6 +1402,9 @@ def _run_gpu_pipeline(
     Returns:
         (per_proof_passed, had_intermediate_truncation, max_intermediate_len)
     """
+    # ── Dispatch to CUDA kernel path if available ─────────────────
+    if device.type == "cuda" and _cuda_mod.is_available():
+        return _run_gpu_pipeline_cuda(plan, device, max_expr_len, verbose=verbose)
     total_nodes = plan.total_nodes
     V = plan.vocab_size
 
@@ -1435,6 +1564,8 @@ def warmup_cuda(device: torch.device) -> None:
     the first few levels of a real run incur compilation latency that
     distorts timing and can make early large batches look slow.
 
+    Also triggers JIT compilation of custom CUDA kernels (if available).
+
     This runs tiny synthetic tensors through every distinct operation used
     in _execute_level and _run_gpu_pipeline so all kernels are compiled and
     resident before the timed verification begins.
@@ -1446,6 +1577,12 @@ def warmup_cuda(device: torch.device) -> None:
     key = device.__str__()
     if key in _CUDA_WARMED_UP:
         return
+
+    # JIT-compile custom CUDA kernels (first call triggers compilation)
+    if _cuda_mod.is_available():
+        print(f"  Custom CUDA kernels: compiled and ready", flush=True)
+    else:
+        print(f"  Custom CUDA kernels: unavailable, using PyTorch fallback", flush=True)
 
     B, S, P, F = 8, 4, 8, 2  # tiny synthetic shapes
 
@@ -1786,7 +1923,14 @@ def _verify_proofs_gpu_batched(
     """
     # MPS shares memory with the CPU/system — be conservative to avoid
     # starving the OS. CUDA has dedicated VRAM so can use more.
-    VRAM_BUDGET_FRACTION = 0.45 if device.type == "mps" else 0.70
+    # With custom CUDA kernels there are zero per-chunk intermediates,
+    # so we can safely use 85% of VRAM (only expr_buffer + tracking).
+    if device.type == "mps":
+        VRAM_BUDGET_FRACTION = 0.45
+    elif device.type == "cuda" and _cuda_mod.is_available():
+        VRAM_BUDGET_FRACTION = 0.85
+    else:
+        VRAM_BUDGET_FRACTION = 0.70
 
     t0 = time.perf_counter()
     N = plan.num_proofs
