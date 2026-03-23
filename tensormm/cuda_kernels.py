@@ -603,7 +603,7 @@ def _try_compile():
     try:
         from torch.utils.cpp_extension import load_inline
         _compiled_module = load_inline(
-            name="mmgpu_cuda_kernels",
+            name="mmgpu_cuda_kernels_v2",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
