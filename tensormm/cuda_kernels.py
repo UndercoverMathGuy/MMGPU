@@ -412,63 +412,10 @@ __global__ void final_check_kernel(
 
     proof_passed[tid] = true;
 }
-"""
 
-_CPP_SOURCE = r"""
-#include <torch/extension.h>
-
-// Forward declarations of kernel launchers
-void push_nodes_launch(
-    torch::Tensor push_global_indices,
-    torch::Tensor push_expressions,
-    torch::Tensor push_expr_lengths,
-    int push_width, int num_push,
-    torch::Tensor expr_buffer,
-    torch::Tensor expr_lengths_buf,
-    torch::Tensor expr_hashes,
-    int max_expr_len
-);
-
-void execute_assertion_launch(
-    int B, int batch_offset,
-    torch::Tensor assertion_idx,
-    torch::Tensor input_global_indices,
-    torch::Tensor input_counts,
-    torch::Tensor fhyp_input_positions,
-    torch::Tensor ehyp_input_positions,
-    torch::Tensor output_global_indices,
-    int max_inputs, int max_fhyps_batch, int max_ehyps_batch,
-    torch::Tensor tbl_pattern_toks,
-    torch::Tensor tbl_pattern_lengths,
-    torch::Tensor tbl_fhyp_var_ids,
-    torch::Tensor tbl_fhyp_count,
-    torch::Tensor tbl_ehyp_patterns,
-    torch::Tensor tbl_ehyp_pattern_lengths,
-    torch::Tensor tbl_ehyp_count,
-    int P_max, int tbl_max_fhyps, int tbl_max_ehyps, int E_max,
-    torch::Tensor expr_buffer,
-    torch::Tensor expr_lengths_buf,
-    torch::Tensor expr_hashes,
-    torch::Tensor node_failed,
-    int max_expr_len
-);
-
-void final_check_launch(
-    int num_proofs,
-    torch::Tensor final_node_indices,
-    torch::Tensor expected_conclusions,
-    torch::Tensor conclusion_lengths,
-    torch::Tensor expected_hashes,
-    int max_concl_stored,
-    torch::Tensor expr_buffer,
-    torch::Tensor expr_lengths_buf,
-    torch::Tensor expr_hashes,
-    torch::Tensor node_failed,
-    int max_expr_len,
-    torch::Tensor proof_passed
-);
-
-// ── Launcher implementations ────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════
+//  Launcher functions (must be in .cu file — they use <<<>>> syntax)
+// ══════════════════════════════════════════════════════════════════════
 
 void push_nodes_launch(
     torch::Tensor push_global_indices,
@@ -578,12 +525,61 @@ void final_check_launch(
         proof_passed.data_ptr<bool>()
     );
 }
+"""
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("push_nodes_launch", &push_nodes_launch, "Push nodes kernel launcher");
-    m.def("execute_assertion_launch", &execute_assertion_launch, "Execute assertion kernel launcher");
-    m.def("final_check_launch", &final_check_launch, "Final check kernel launcher");
-}
+_CPP_SOURCE = r"""
+#include <torch/extension.h>
+
+// Forward declarations — implementations are in the .cu file
+void push_nodes_launch(
+    torch::Tensor push_global_indices,
+    torch::Tensor push_expressions,
+    torch::Tensor push_expr_lengths,
+    int push_width, int num_push,
+    torch::Tensor expr_buffer,
+    torch::Tensor expr_lengths_buf,
+    torch::Tensor expr_hashes,
+    int max_expr_len
+);
+
+void execute_assertion_launch(
+    int B, int batch_offset,
+    torch::Tensor assertion_idx,
+    torch::Tensor input_global_indices,
+    torch::Tensor input_counts,
+    torch::Tensor fhyp_input_positions,
+    torch::Tensor ehyp_input_positions,
+    torch::Tensor output_global_indices,
+    int max_inputs, int max_fhyps_batch, int max_ehyps_batch,
+    torch::Tensor tbl_pattern_toks,
+    torch::Tensor tbl_pattern_lengths,
+    torch::Tensor tbl_fhyp_var_ids,
+    torch::Tensor tbl_fhyp_count,
+    torch::Tensor tbl_ehyp_patterns,
+    torch::Tensor tbl_ehyp_pattern_lengths,
+    torch::Tensor tbl_ehyp_count,
+    int P_max, int tbl_max_fhyps, int tbl_max_ehyps, int E_max,
+    torch::Tensor expr_buffer,
+    torch::Tensor expr_lengths_buf,
+    torch::Tensor expr_hashes,
+    torch::Tensor node_failed,
+    int max_expr_len
+);
+
+void final_check_launch(
+    int num_proofs,
+    torch::Tensor final_node_indices,
+    torch::Tensor expected_conclusions,
+    torch::Tensor conclusion_lengths,
+    torch::Tensor expected_hashes,
+    int max_concl_stored,
+    torch::Tensor expr_buffer,
+    torch::Tensor expr_lengths_buf,
+    torch::Tensor expr_hashes,
+    torch::Tensor node_failed,
+    int max_expr_len,
+    torch::Tensor proof_passed
+);
 """
 
 # ══════════════════════════════════════════════════════════════════════
