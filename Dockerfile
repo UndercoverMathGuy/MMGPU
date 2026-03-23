@@ -17,7 +17,8 @@ ENV PYTORCH_ALLOC_CONF=expandable_segments:True
 
 # Install Python 3.12 + pip + wget
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv wget \
+    python3 python3-pip python3-venv python3-dev \
+    g++ gcc wget \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
