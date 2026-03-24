@@ -30,6 +30,7 @@ _CUDA_SOURCE = r"""
 #include <torch/extension.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cstdint>
 
 // ─── Constants ───────────────────────────────────────────────────────
 static constexpr long long HASH_BASE = 1000000007LL;
@@ -437,7 +438,7 @@ void push_nodes_launch(
         push_width, num_push,
         expr_buffer.data_ptr<int>(),
         expr_lengths_buf.data_ptr<int>(),
-        expr_hashes.data_ptr<long long>(),
+        reinterpret_cast<long long*>(expr_hashes.data_ptr<int64_t>()),
         max_expr_len
     );
 }
@@ -487,7 +488,7 @@ void execute_assertion_launch(
         P_max, tbl_max_fhyps, tbl_max_ehyps, E_max,
         expr_buffer.data_ptr<int>(),
         expr_lengths_buf.data_ptr<int>(),
-        expr_hashes.data_ptr<long long>(),
+        reinterpret_cast<long long*>(expr_hashes.data_ptr<int64_t>()),
         node_failed.data_ptr<bool>(),
         max_expr_len
     );
@@ -515,11 +516,11 @@ void final_check_launch(
         final_node_indices.data_ptr<int>(),
         expected_conclusions.data_ptr<int>(),
         conclusion_lengths.data_ptr<int>(),
-        expected_hashes.data_ptr<long long>(),
+        reinterpret_cast<const long long*>(expected_hashes.data_ptr<int64_t>()),
         max_concl_stored,
         expr_buffer.data_ptr<int>(),
         expr_lengths_buf.data_ptr<int>(),
-        expr_hashes.data_ptr<long long>(),
+        reinterpret_cast<const long long*>(expr_hashes.data_ptr<int64_t>()),
         node_failed.data_ptr<bool>(),
         max_expr_len,
         proof_passed.data_ptr<bool>()
@@ -603,7 +604,7 @@ def _try_compile():
     try:
         from torch.utils.cpp_extension import load_inline
         _compiled_module = load_inline(
-            name="mmgpu_cuda_kernels_v2",
+            name="mmgpu_cuda_kernels_v3",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
