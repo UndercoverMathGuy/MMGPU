@@ -1991,9 +1991,8 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
     """
     assertion = parsed.assertions[theorem_label]
     variables = parsed.variables
-    # Active $d pairs for this proof context — stored as a set of frozensets
-    # so (v, w) and (w, v) both match.
-    active_dv: set[frozenset] = {frozenset(p) for p in assertion.all_disjoint_vars}
+    # Parser stores pairs as (min, max) canonical tuples — reuse that directly.
+    active_dv: set[tuple[str, str]] = set(assertion.all_disjoint_vars)
 
     def _info(lbl: str):
         if lbl in parsed.floating_hyps:
@@ -2038,7 +2037,7 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
             sy = _vars_in_expr(subst.get(y, [y]), variables)
             for v in sx:
                 for w in sy:
-                    if v == w or frozenset((v, w)) not in active_dv:
+                    if v == w or (min(v, w), max(v, w)) not in active_dv:
                         return False
         del stack[len(stack) - n_pop:]
         stack.append(_apply_subst(a.expression, subst))
