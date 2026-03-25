@@ -1,23 +1,23 @@
 """Tests for tensormm.cuda_kernels — custom CUDA kernel correctness.
 
-Tests run on CUDA GPU only (skipped if unavailable). Each test compares
-the CUDA kernel output against the existing PyTorch tensor-op path as
-an oracle, ensuring bit-exact equivalence.
+Tests run on CUDA GPU only (skipped if unavailable).  Full-pipeline tests
+compare the CUDA path against metamath-knife as the ground-truth oracle.
+Torch-path vs CUDA-path equivalence tests remain as internal consistency checks.
 """
 from __future__ import annotations
 
 import os
+import subprocess
+import shutil
 
 import numpy as np
 import pytest
 import torch
 
-from tensormm.cpu_verifier import CPUVerifier
 from tensormm.gpu_verifier import (
     build_all_proof_graphs,
     pack_levels,
     verify_database,
-    _build_label_info,
     _run_gpu_pipeline,
     _run_gpu_pipeline_cuda,
 )
@@ -48,9 +48,23 @@ def _build_plan(parsed, theorems=None):
         tokenizer.encode_symbol(c)
     for v in parsed.variables:
         tokenizer.encode_symbol(v)
-    graphs, errors = build_all_proof_graphs(parsed, theorems)
+    graphs, _ = build_all_proof_graphs(parsed, theorems)
     plan = pack_levels(graphs, parsed, tokenizer)
     return plan, graphs
+
+
+def _knife_verify(mm_path: str) -> bool:
+    """Run metamath-knife --verify; return True if exit 0."""
+    knife = shutil.which("metamath-knife")
+    if knife is None:
+        pytest.skip("metamath-knife not installed")
+    r = subprocess.run(
+        [knife, "--verify", mm_path],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return r.returncode == 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -76,7 +90,7 @@ class TestCudaKernelAvailability:
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  CUDA vs Torch path equivalence
+#  CUDA vs Torch path equivalence (internal consistency)
 # ══════════════════════════════════════════════════════════════════════
 
 
@@ -88,13 +102,10 @@ class TestCudaVsTorch:
         plan, _ = _build_plan(parsed)
         device = torch.device("cuda")
 
-        # Run torch path
-        torch_result, torch_trunc, torch_max = _run_gpu_pipeline(
+        torch_result, _, _ = _run_gpu_pipeline(
             plan, torch.device("cpu"), plan.max_expr_len, verbose=False
         )
-
-        # Run CUDA path
-        cuda_result, cuda_trunc, cuda_max = _run_gpu_pipeline_cuda(
+        cuda_result, _, _ = _run_gpu_pipeline_cuda(
             plan, device, plan.max_expr_len, verbose=False
         )
 
@@ -112,7 +123,6 @@ class TestCudaVsTorch:
         torch_result, _, _ = _run_gpu_pipeline(
             plan, torch.device("cpu"), plan.max_expr_len, verbose=False
         )
-
         cuda_result, _, _ = _run_gpu_pipeline_cuda(
             plan, device, plan.max_expr_len, verbose=False
         )
@@ -122,53 +132,63 @@ class TestCudaVsTorch:
             err_msg="CUDA and torch paths diverge on ql.mm"
         )
 
+    def test_anatomy_equivalence(self) -> None:
+        """CUDA and torch paths must produce identical results on anatomy.mm."""
+        parsed = _load_mm("anatomy.mm")
+        plan, _ = _build_plan(parsed)
+        device = torch.device("cuda")
+
+        torch_result, _, _ = _run_gpu_pipeline(
+            plan, torch.device("cpu"), plan.max_expr_len, verbose=False
+        )
+        cuda_result, _, _ = _run_gpu_pipeline_cuda(
+            plan, device, plan.max_expr_len, verbose=False
+        )
+
+        np.testing.assert_array_equal(
+            cuda_result, torch_result,
+            err_msg="CUDA and torch paths diverge on anatomy.mm"
+        )
+
 
 # ══════════════════════════════════════════════════════════════════════
-#  Full pipeline correctness (CUDA path vs CPU oracle)
+#  Full pipeline correctness (CUDA path vs metamath-knife oracle)
 # ══════════════════════════════════════════════════════════════════════
 
 
 class TestCudaFullPipeline:
 
-    def test_demo0_vs_cpu(self) -> None:
-        """Full CUDA pipeline on demo0.mm must match CPU verifier."""
+    def test_demo0_vs_knife(self) -> None:
+        """Full CUDA pipeline on demo0.mm must agree with metamath-knife."""
+        path = os.path.join(DATA_DIR, "demo0.mm")
+        assert _knife_verify(path), "knife rejected demo0.mm"
+
         parsed = _load_mm("demo0.mm")
-        device = torch.device("cuda")
+        results = verify_database(parsed, device=torch.device("cuda"), verbose=False)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, f"{n_fail} CUDA failures on demo0.mm"
 
-        gpu_results = verify_database(parsed, device=device, verbose=False)
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
+    def test_anatomy_vs_knife(self) -> None:
+        """Full CUDA pipeline on anatomy.mm must agree with metamath-knife."""
+        path = os.path.join(DATA_DIR, "anatomy.mm")
+        if not os.path.exists(path):
+            pytest.skip("anatomy.mm not found")
+        assert _knife_verify(path), "knife rejected anatomy.mm"
 
-        for lbl, cpu_r in cpu_results.items():
-            assert lbl in gpu_results, f"GPU missing theorem {lbl}"
-            assert gpu_results[lbl] == cpu_r.success, (
-                f"Divergence on {lbl}: GPU={gpu_results[lbl]}, "
-                f"CPU={cpu_r.success} (err={cpu_r.error_message})"
-            )
+        parsed = _load_mm("anatomy.mm")
+        results = verify_database(parsed, device=torch.device("cuda"), verbose=False)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, f"{n_fail} CUDA failures on anatomy.mm"
 
-    def test_ql_vs_cpu(self) -> None:
-        """Full CUDA pipeline on ql.mm must match CPU verifier."""
+    def test_ql_vs_knife(self) -> None:
+        """Full CUDA pipeline on ql.mm must agree with metamath-knife."""
+        path = os.path.join(DATA_DIR, "ql.mm")
+        assert _knife_verify(path), "knife rejected ql.mm"
+
         parsed = _load_mm("ql.mm")
-        device = torch.device("cuda")
-
-        gpu_results = verify_database(parsed, device=device, verbose=False)
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
-
-        divergences = []
-        for lbl, cpu_r in cpu_results.items():
-            if lbl not in gpu_results:
-                divergences.append(f"GPU missing: {lbl}")
-                continue
-            if gpu_results[lbl] != cpu_r.success:
-                divergences.append(
-                    f"{lbl}: GPU={gpu_results[lbl]}, CPU={cpu_r.success} "
-                    f"(err={cpu_r.error_message})"
-                )
-
-        assert len(divergences) == 0, (
-            f"{len(divergences)} divergences:\n" + "\n".join(divergences[:20])
-        )
+        results = verify_database(parsed, device=torch.device("cuda"), verbose=False)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, f"{n_fail} CUDA failures on ql.mm"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -179,11 +199,7 @@ class TestCudaFullPipeline:
 class TestCudaMemory:
 
     def test_no_intermediate_allocations(self) -> None:
-        """CUDA path should use only expr_buffer + tracking + table memory.
-
-        Verifies that peak GPU memory stays within expected bounds (no
-        multi-GB intermediate tensors from gather/scatter/replication).
-        """
+        """CUDA path should use only expr_buffer + tracking + table memory."""
         parsed = _load_mm("ql.mm")
         plan, _ = _build_plan(parsed)
         device = torch.device("cuda")
@@ -194,16 +210,11 @@ class TestCudaMemory:
         _run_gpu_pipeline_cuda(plan, device, plan.max_expr_len, verbose=False)
 
         peak_bytes = torch.cuda.max_memory_allocated(device)
-        # Expected: packed expr_buffer + tracking + assertion table + offsets
-        # expr_buffer: total_expr_tokens × 2 (int16, packed 1D)
-        # tracking: total_nodes × (4 + 8 + 1) = 13 bytes
-        # offsets: (total_nodes + 1) × 8 bytes
         expected_base = (
-            plan.total_expr_tokens * 2  # packed expr_buffer
-            + plan.total_nodes * 13     # tracking arrays
-            + (plan.total_nodes + 1) * 8  # expr_offsets
+            plan.total_expr_tokens * 2
+            + plan.total_nodes * 13
+            + (plan.total_nodes + 1) * 8
         )
-        # Allow 3x for assertion table + upload temporaries
         assert peak_bytes < expected_base * 3, (
             f"Peak GPU memory {peak_bytes / 1e9:.2f} GB exceeds "
             f"3x expected base {expected_base * 3 / 1e9:.2f} GB — "

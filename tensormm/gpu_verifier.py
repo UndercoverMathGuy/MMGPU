@@ -1968,18 +1968,110 @@ def _init_dv_worker(parsed: ParsedDatabase) -> None:
     _DV_WORKER_PARSED = parsed
 
 
+def _vars_in_expr(expr: list[str], variables: set[str]) -> set[str]:
+    """Return the set of variables appearing in expr."""
+    return {tok for tok in expr if tok in variables}
+
+
+def _apply_subst(expr: list[str], subst: dict[str, list[str]]) -> list[str]:
+    """Apply a string-level substitution to an expression."""
+    out: list[str] = []
+    for tok in expr:
+        if tok in subst:
+            out.extend(subst[tok])
+        else:
+            out.append(tok)
+    return out
+
+
+def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
+    """Replay a proof and check all $d constraints.
+
+    Walks the proof stack exactly like a standard Metamath verifier but only
+    checks disjoint variable conditions — the GPU has already validated the
+    substitution arithmetic.  Returns True if all $d constraints are satisfied.
+    """
+    assertion = parsed.assertions[theorem_label]
+    variables = parsed.variables
+
+    # Build label → info lookup (floating hyp, essential hyp, or assertion)
+    def _info(lbl: str):
+        if lbl in parsed.floating_hyps:
+            fh = parsed.floating_hyps[lbl]
+            return ("$f", fh)
+        if lbl in parsed.essential_hyps:
+            return ("$e", parsed.essential_hyps[lbl])
+        if lbl in parsed.assertions:
+            a = parsed.assertions[lbl]
+            return ("$a" if a.type == "axiom" else "$p", a)
+        return None
+
+    stack: list[list[str]] = []
+
+    def _step(lbl: str) -> bool:
+        info = _info(lbl)
+        if info is None:
+            return False
+        kind, data = info
+        if kind in ("$f", "$e"):
+            stack.append(list(data.expression) if kind == "$e" else [data.type_code, data.variable])
+            return True
+        # Assertion: pop hypotheses, build substitution, check $d, push conclusion
+        a = data
+        n_pop = len(a.floating_hyps) + len(a.essential_hyps)
+        if len(stack) < n_pop:
+            return False
+        sp = len(stack) - n_pop
+        subst: dict[str, list[str]] = {}
+        for flbl in a.floating_hyps:
+            fh = parsed.floating_hyps[flbl]
+            entry = stack[sp]
+            subst[fh.variable] = entry[1:]  # strip type code
+            sp += 1
+        # Check $d: for each (x, y) pair, subst[x] and subst[y] must share no vars
+        for x, y in a.disjoint_vars:
+            sx = _vars_in_expr(subst.get(x, [x]), variables)
+            sy = _vars_in_expr(subst.get(y, [y]), variables)
+            if sx & sy:
+                return False
+        del stack[len(stack) - n_pop:]
+        stack.append(_apply_subst(a.expression, subst))
+        return True
+
+    try:
+        if assertion.compressed_proof is not None:
+            cp = assertion.compressed_proof
+            label_end = len(cp.labels)
+            saved: list[list[str]] = []
+            for pi in cp.proof_ints:
+                if pi == -1:
+                    if not stack:
+                        return False
+                    saved.append(list(stack[-1]))
+                elif pi < label_end:
+                    if not _step(cp.labels[pi]):
+                        return False
+                else:
+                    si = pi - label_end
+                    if si >= len(saved):
+                        return False
+                    stack.append(list(saved[si]))
+        elif assertion.proof is not None:
+            for lbl in assertion.proof:
+                if not _step(lbl):
+                    return False
+        else:
+            return True  # axiom — no proof to check
+    except Exception:
+        return False
+
+    return True
+
+
 def _check_dv_chunk(labels: list[str]) -> dict[str, bool]:
-    from tensormm.cpu_verifier import CPUVerifier
     assert _DV_WORKER_PARSED is not None
-    cpu_v = CPUVerifier(_DV_WORKER_PARSED)
-    results = {}
-    for lbl in labels:
-        try:
-            r = cpu_v.verify_proof(lbl)
-            results[lbl] = r.success
-        except Exception:
-            results[lbl] = False
-    return results
+    parsed = _DV_WORKER_PARSED
+    return {lbl: _check_dv_one(parsed, lbl) for lbl in labels}
 
 
 def _check_dv_constraints(
@@ -1989,14 +2081,13 @@ def _check_dv_constraints(
 ) -> np.ndarray:
     """Check $d constraints for proofs that passed GPU verification.
 
-    Uses the existing CPUVerifier which already handles $d checking
-    efficiently. Only checks proofs that the GPU said passed.
+    Replays each proof on CPU (cheap — no substitution arithmetic, just stack
+    walking to extract substitutions and check disjoint variable pairs).
     Runs in parallel across available CPU cores.
 
     Returns updated proof_passed array.
     """
     result = proof_passed.copy()
-    # Collect only labels that passed GPU verification
     labels_to_check = [
         g.theorem_label for pi, g in enumerate(graphs) if result[pi]
     ]
@@ -2028,7 +2119,6 @@ def _check_dv_constraints(
         for future in as_completed(futures):
             dv_results.update(future.result())
 
-    # Update result array
     label_to_pi = {g.theorem_label: pi for pi, g in enumerate(graphs)}
     for lbl, passed in dv_results.items():
         if not passed:

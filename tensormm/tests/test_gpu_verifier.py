@@ -1,22 +1,21 @@
-"""Tests for tensormm.gpu_verifier — true GPU-accelerated verification.
+"""Tests for tensormm.gpu_verifier — graph construction, level packing, GPU execution.
 
-Validates graph construction, level packing, GPU execution, and the
-full pipeline against the CPU verifier as oracle.
+Full-pipeline correctness is validated against metamath-knife as the oracle.
 """
 from __future__ import annotations
 
 import os
+import subprocess
+import shutil
 
 import pytest
 import torch
 
-from tensormm.cpu_verifier import CPUVerifier
 from tensormm.gpu_verifier import (
     build_proof_graph,
     build_all_proof_graphs,
     pack_levels,
     verify_database,
-    verify_proofs_gpu,
     _build_label_info,
 )
 from tensormm.parser import ParsedDatabase, parse_mm_file
@@ -30,6 +29,20 @@ def _load_mm(name: str) -> ParsedDatabase:
     if not os.path.exists(path):
         pytest.skip(f"{name} not found in data/")
     return parse_mm_file(path)
+
+
+def _knife_verify(mm_path: str) -> bool:
+    """Run metamath-knife --verify; return True if exit 0."""
+    knife = shutil.which("metamath-knife")
+    if knife is None:
+        pytest.skip("metamath-knife not installed")
+    r = subprocess.run(
+        [knife, "--verify", mm_path],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    return r.returncode == 0
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -72,19 +85,16 @@ class TestGraphConstruction:
         parsed = _load_mm("demo0.mm")
         label_info = _build_label_info(parsed)
 
-        # Pick the first theorem
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
         g = build_proof_graph(parsed, theorems[0], label_info)
         assert not isinstance(g, str), f"Failed: {g}"
 
-        # All push nodes should be level 0
         for node in g.nodes:
             if node.node_type in ("push_f", "push_e"):
                 assert node.level == 0
                 assert node.expression is not None
                 assert len(node.input_steps) == 0
             elif node.node_type == "assertion":
-                # Assertions with 0 inputs (e.g., nullary axioms) can be level 0
                 assert node.level >= 0
                 if node.input_steps:
                     assert node.level >= 1
@@ -95,7 +105,6 @@ class TestGraphConstruction:
         label_info = _build_label_info(parsed)
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
 
-        # Find a theorem with compressed proof
         found_compressed = False
         for lbl in theorems:
             a = parsed.assertions[lbl]
@@ -112,14 +121,12 @@ class TestGraphConstruction:
         label_info = _build_label_info(parsed)
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
 
-        # Serial
         serial = []
         for lbl in theorems:
             r = build_proof_graph(parsed, lbl, label_info)
             if not isinstance(r, str):
                 serial.append(r.theorem_label)
 
-        # Parallel
         graphs, errors = build_all_proof_graphs(parsed, theorems, max_workers=2)
         parallel = [g.theorem_label for g in graphs]
 
@@ -131,7 +138,7 @@ class TestGraphConstruction:
         label_info = _build_label_info(parsed)
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
 
-        for lbl in theorems[:50]:  # check first 50
+        for lbl in theorems[:50]:
             g = build_proof_graph(parsed, lbl, label_info)
             if isinstance(g, str):
                 continue
@@ -170,7 +177,6 @@ class TestLevelPacking:
         assert plan.max_expr_len >= 1
         assert plan.num_proofs == len(graphs)
         assert len(plan.push_global_indices) > 0
-        # push_expressions is stored at actual max push width, not max_expr_len
         assert plan.push_expressions.shape[0] == len(plan.push_global_indices)
         assert plan.push_expressions.shape[1] >= 1
 
@@ -187,7 +193,6 @@ class TestLevelPacking:
         graphs, _ = build_all_proof_graphs(parsed, theorems)
         plan = pack_levels(graphs, parsed, tokenizer)
 
-        # ql.mm should have assertions with essential hyps in the table
         assert plan.assertion_table.ehyp_count.max() > 0, \
             "ql.mm should have assertions with essential hypotheses"
 
@@ -204,56 +209,39 @@ class TestLevelPacking:
         graphs, _ = build_all_proof_graphs(parsed, theorems)
         plan = pack_levels(graphs, parsed, tokenizer)
 
-        # Should be at least 512 (our floor)
         assert plan.max_expr_len >= 512
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Phase 3: GPU Execution + Full Pipeline
+#  Phase 3: Full Pipeline — GPU vs metamath-knife
 # ══════════════════════════════════════════════════════════════════════
 
 
 class TestFullPipeline:
 
     def test_demo0_full(self) -> None:
-        """Full pipeline on demo0.mm must match CPU verifier."""
+        """Full pipeline on demo0.mm: GPU must pass all knife-validated theorems."""
+        path = os.path.join(DATA_DIR, "demo0.mm")
+        if not os.path.exists(path):
+            pytest.skip("demo0.mm not found")
+        assert _knife_verify(path), "knife rejected demo0.mm"
+
         parsed = _load_mm("demo0.mm")
-        device = torch.device("cpu")
-
-        gpu_results = verify_database(parsed, device=device, verbose=True)
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
-
-        for lbl, cpu_r in cpu_results.items():
-            assert lbl in gpu_results, f"GPU missing theorem {lbl}"
-            assert gpu_results[lbl] == cpu_r.success, (
-                f"Divergence on {lbl}: GPU={gpu_results[lbl]}, "
-                f"CPU={cpu_r.success} (err={cpu_r.error_message})"
-            )
+        results = verify_database(parsed, device=torch.device("cpu"), verbose=True)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, f"{n_fail} GPU failures on demo0.mm"
 
     def test_ql_full(self) -> None:
-        """Full pipeline on ql.mm must match CPU verifier."""
+        """Full pipeline on ql.mm: GPU must pass all knife-validated theorems."""
+        path = os.path.join(DATA_DIR, "ql.mm")
+        if not os.path.exists(path):
+            pytest.skip("ql.mm not found")
+        assert _knife_verify(path), "knife rejected ql.mm"
+
         parsed = _load_mm("ql.mm")
-        device = torch.device("cpu")
-
-        gpu_results = verify_database(parsed, device=device, verbose=True)
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
-
-        divergences = []
-        for lbl, cpu_r in cpu_results.items():
-            if lbl not in gpu_results:
-                divergences.append(f"GPU missing: {lbl}")
-                continue
-            if gpu_results[lbl] != cpu_r.success:
-                divergences.append(
-                    f"{lbl}: GPU={gpu_results[lbl]}, CPU={cpu_r.success} "
-                    f"(err={cpu_r.error_message})"
-                )
-
-        assert len(divergences) == 0, (
-            f"{len(divergences)} divergences:\n" + "\n".join(divergences[:20])
-        )
+        results = verify_database(parsed, device=torch.device("cpu"), verbose=True)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, f"{n_fail} GPU failures on ql.mm"
 
     def test_ehyp_masking_no_false_failures(self) -> None:
         """Assertions with different ehyp counts must not cause false failures.
@@ -263,26 +251,10 @@ class TestFullPipeline:
         with fewer ehyps than the batch max.
         """
         parsed = _load_mm("ql.mm")
-        device = torch.device("cpu")
-        gpu_results = verify_database(parsed, device=device, check_dv=False)
-
-        # CPU oracle (without $d for fair comparison)
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
-
-        # Count how many GPU says pass vs CPU says pass
-        gpu_pass = sum(1 for v in gpu_results.values() if v)
-        cpu_pass = sum(1 for v in cpu_results.values() if v.success)
-
-        # GPU should pass at least as many as CPU (without $d, GPU might pass more)
-        # But critically: no FALSE FAILURES (GPU fail when CPU pass)
-        false_failures = [
-            lbl for lbl, cpu_r in cpu_results.items()
-            if cpu_r.success and lbl in gpu_results and not gpu_results[lbl]
-        ]
-        assert len(false_failures) == 0, (
-            f"{len(false_failures)} false GPU failures (CPU pass, GPU fail):\n"
-            + "\n".join(false_failures[:20])
+        results = verify_database(parsed, device=torch.device("cpu"), check_dv=False)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, (
+            f"{n_fail} false GPU failures on ql.mm (ehyp masking broken?)"
         )
 
 
@@ -299,25 +271,26 @@ class TestGPUDevice:
 
     @pytest.mark.skipif(not (CUDA_AVAILABLE or MPS_AVAILABLE), reason="No GPU")
     def test_demo0_on_gpu(self) -> None:
-        """demo0.mm on actual GPU device."""
-        parsed = _load_mm("demo0.mm")
-        gpu_results = verify_database(parsed, verbose=True)
+        """demo0.mm on actual GPU device — must agree with knife."""
+        path = os.path.join(DATA_DIR, "demo0.mm")
+        if not os.path.exists(path):
+            pytest.skip("demo0.mm not found")
+        assert _knife_verify(path), "knife rejected demo0.mm"
 
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
-        for lbl, cpu_r in cpu_results.items():
-            assert gpu_results.get(lbl) == cpu_r.success
+        parsed = _load_mm("demo0.mm")
+        results = verify_database(parsed, verbose=True)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0
 
     @pytest.mark.skipif(not (CUDA_AVAILABLE or MPS_AVAILABLE), reason="No GPU")
     def test_ql_on_gpu(self) -> None:
-        """ql.mm on actual GPU device."""
-        parsed = _load_mm("ql.mm")
-        gpu_results = verify_database(parsed, verbose=True)
+        """ql.mm on actual GPU device — must agree with knife."""
+        path = os.path.join(DATA_DIR, "ql.mm")
+        if not os.path.exists(path):
+            pytest.skip("ql.mm not found")
+        assert _knife_verify(path), "knife rejected ql.mm"
 
-        cpu_v = CPUVerifier(parsed)
-        cpu_results = cpu_v.verify_all()
-        divergences = [
-            lbl for lbl, cpu_r in cpu_results.items()
-            if gpu_results.get(lbl) != cpu_r.success
-        ]
-        assert len(divergences) == 0, f"{len(divergences)} divergences"
+        parsed = _load_mm("ql.mm")
+        results = verify_database(parsed, verbose=True)
+        n_fail = sum(1 for v in results.values() if not v)
+        assert n_fail == 0, f"{n_fail} divergences on ql.mm"
