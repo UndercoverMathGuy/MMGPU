@@ -1960,13 +1960,6 @@ def verify_proofs_gpu(
 # ══════════════════════════════════════════════════════════════════════
 
 
-_DV_WORKER_PARSED: ParsedDatabase | None = None
-
-
-def _init_dv_worker(parsed: ParsedDatabase) -> None:
-    global _DV_WORKER_PARSED
-    _DV_WORKER_PARSED = parsed
-
 
 def _vars_in_expr(expr: list[str], variables: set[str]) -> set[str]:
     """Return the set of variables appearing in expr."""
@@ -2068,10 +2061,18 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
     return True
 
 
+
+_DV_WORKER_PARSED: ParsedDatabase | None = None
+
+
+def _init_dv_worker(parsed: ParsedDatabase) -> None:
+    global _DV_WORKER_PARSED
+    _DV_WORKER_PARSED = parsed
+
+
 def _check_dv_chunk(labels: list[str]) -> dict[str, bool]:
     assert _DV_WORKER_PARSED is not None
-    parsed = _DV_WORKER_PARSED
-    return {lbl: _check_dv_one(parsed, lbl) for lbl in labels}
+    return {lbl: _check_dv_one(_DV_WORKER_PARSED, lbl) for lbl in labels}
 
 
 def _check_dv_constraints(
@@ -2081,9 +2082,9 @@ def _check_dv_constraints(
 ) -> np.ndarray:
     """Check $d constraints for proofs that passed GPU verification.
 
-    Replays each proof on CPU (cheap — no substitution arithmetic, just stack
-    walking to extract substitutions and check disjoint variable pairs).
-    Runs in parallel across available CPU cores.
+    Replays each proof on CPU (cheap — just stack walking to extract
+    substitutions and check disjoint variable pairs, no GPU involvement).
+    Uses spawn context so workers never inherit the parent's CUDA state.
 
     Returns updated proof_passed array.
     """
@@ -2101,17 +2102,14 @@ def _check_dv_constraints(
         for i in range(0, len(labels_to_check), chunk_size)
     ]
 
-    global _DV_WORKER_PARSED
-    if sys.platform == "linux":
-        _DV_WORKER_PARSED = parsed
-        ctx = multiprocessing.get_context("fork")
-        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
-    else:
-        pool = ProcessPoolExecutor(
-            max_workers=workers,
-            initializer=_init_dv_worker,
-            initargs=(parsed,),
-        )
+    # Always use spawn — fork inherits CUDA context and deadlocks.
+    ctx = multiprocessing.get_context("spawn")
+    pool = ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=ctx,
+        initializer=_init_dv_worker,
+        initargs=(parsed,),
+    )
 
     dv_results: dict[str, bool] = {}
     with pool as executor:
