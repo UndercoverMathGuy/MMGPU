@@ -32,8 +32,9 @@ _CUDA_SOURCE = r"""
 #include <cuda_runtime.h>
 #include <cstdint>
 
-// ─── Constants ───────────────────────────────────────────────────────
+// ─── Constants & types ───────────────────────────────────────────────
 static constexpr long long HASH_BASE = 1000000007LL;
+using tok_t = unsigned short;  // uint16 token type — halves expr_buffer memory
 
 // ─── Helper: stream-substitute a pattern and compare against a target ─
 // Returns true if the substituted pattern matches the target exactly.
@@ -47,23 +48,23 @@ static constexpr long long HASH_BASE = 1000000007LL;
 // reads which are L2-cache-friendly for the typical access pattern.
 __device__ bool stream_substitute_and_compare(
     // Assertion table row for this node's assertion
-    const int* __restrict__ pattern,       // [P_max] row in tbl_pattern_toks
+    const tok_t* __restrict__ pattern,       // [P_max] row in tbl_pattern_toks
     int pat_len,
-    const int* __restrict__ fhyp_var_ids,  // [max_fhyps] row in tbl
+    const tok_t* __restrict__ fhyp_var_ids,  // [max_fhyps] row in tbl
     int n_fhyps,
-    // Substitution source: expr_buffer rows for each $f input
-    const int* __restrict__ expr_buffer,   // [total_nodes, max_expr_len]
+    // Substitution source: packed 1D expr_buffer
+    const tok_t* __restrict__ expr_buffer,   // [total_expr_tokens] packed
     const int* __restrict__ expr_lengths,  // [total_nodes]
-    int max_expr_len,
+    const long long* __restrict__ expr_offsets,  // [total_nodes+1]
     const int* __restrict__ fhyp_input_global, // [n_fhyps] global indices of $f inputs
     // Target to compare against
-    const int* __restrict__ target_row,    // [max_expr_len] row in expr_buffer
+    const tok_t* __restrict__ target_row,    // packed row in expr_buffer
     int target_len
 ) {
     int out_pos = 0;
 
     for (int p = 0; p < pat_len; p++) {
-        int tok = pattern[p];
+        tok_t tok = pattern[p];
 
         // Check if tok is a variable
         int matched_f = -1;
@@ -81,7 +82,7 @@ __device__ bool stream_substitute_and_compare(
             int sub_len = input_len - 1;  // skip type code at position 0
             if (sub_len < 0) sub_len = 0;
 
-            const int* sub_row = expr_buffer + (long long)input_gi * max_expr_len + 1;
+            const tok_t* sub_row = expr_buffer + expr_offsets[input_gi] + 1;
             for (int s = 0; s < sub_len; s++) {
                 if (out_pos >= target_len) return false;
                 if (sub_row[s] != target_row[out_pos]) return false;
@@ -103,23 +104,24 @@ __device__ bool stream_substitute_and_compare(
 // Also computes the polynomial rolling hash as tokens are written.
 // Returns the output length.
 __device__ int stream_substitute_and_write(
-    const int* __restrict__ pattern,
+    const tok_t* __restrict__ pattern,
     int pat_len,
-    const int* __restrict__ fhyp_var_ids,
+    const tok_t* __restrict__ fhyp_var_ids,
     int n_fhyps,
-    const int* __restrict__ expr_buffer,
+    const tok_t* __restrict__ expr_buffer,
     const int* __restrict__ expr_lengths,
-    int max_expr_len,
+    const long long* __restrict__ expr_offsets,
     const int* __restrict__ fhyp_input_global,
     // Output destination
-    int* __restrict__ output_row,          // [max_expr_len] row to write
-    long long* __restrict__ out_hash       // single hash value to write
+    tok_t* __restrict__ output_row,          // packed row to write
+    long long* __restrict__ out_hash,      // single hash value to write
+    int out_capacity                       // pre-computed capacity of output_row
 ) {
     int out_pos = 0;
     long long h = 0;
 
     for (int p = 0; p < pat_len; p++) {
-        int tok = pattern[p];
+        tok_t tok = pattern[p];
 
         int matched_f = -1;
         for (int f = 0; f < n_fhyps; f++) {
@@ -135,18 +137,18 @@ __device__ int stream_substitute_and_write(
             int sub_len = input_len - 1;
             if (sub_len < 0) sub_len = 0;
 
-            const int* sub_row = expr_buffer + (long long)input_gi * max_expr_len + 1;
+            const tok_t* sub_row = expr_buffer + expr_offsets[input_gi] + 1;
             for (int s = 0; s < sub_len; s++) {
-                int val = sub_row[s];
+                tok_t val = sub_row[s];
                 h = h * HASH_BASE + (long long)val;
-                if (out_pos < max_expr_len) {
+                if (out_pos < out_capacity) {
                     output_row[out_pos] = val;
                 }
                 out_pos++;
             }
         } else {
             h = h * HASH_BASE + (long long)tok;
-            if (out_pos < max_expr_len) {
+            if (out_pos < out_capacity) {
                 output_row[out_pos] = tok;
             }
             out_pos++;
@@ -167,37 +169,38 @@ __device__ int stream_substitute_and_write(
 __global__ void push_nodes_kernel(
     // Push data
     const int* __restrict__ push_global_indices,  // [num_push]
-    const int* __restrict__ push_expressions,     // [num_push, push_width]
+    const tok_t* __restrict__ push_expressions,     // [num_push, push_width]
     const int* __restrict__ push_expr_lengths,    // [num_push]
     int push_width,
     int num_push,
-    // Output buffers
-    int* __restrict__ expr_buffer,                // [total_nodes, max_expr_len]
+    // Output buffers (packed 1D)
+    tok_t* __restrict__ expr_buffer,                // [total_expr_tokens] packed
     int* __restrict__ expr_lengths_buf,           // [total_nodes]
     long long* __restrict__ expr_hashes,          // [total_nodes]
-    int max_expr_len
+    const long long* __restrict__ expr_offsets    // [total_nodes+1]
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_push) return;
 
     int gi = push_global_indices[tid];
     int len = push_expr_lengths[tid];
-    const int* src = push_expressions + (long long)tid * push_width;
-    int* dst = expr_buffer + (long long)gi * max_expr_len;
+    const tok_t* src = push_expressions + (long long)tid * push_width;
+    tok_t* dst = expr_buffer + expr_offsets[gi];
+    int capacity = (int)(expr_offsets[gi + 1] - expr_offsets[gi]);
 
     // Copy expression
     long long h = 0;
-    int copy_len = len < max_expr_len ? len : max_expr_len;
+    int copy_len = len < capacity ? len : capacity;
     for (int i = 0; i < copy_len; i++) {
         dst[i] = src[i];
         h = h * HASH_BASE + (long long)src[i];
     }
-    // Hash includes tokens beyond max_expr_len if any (for correctness)
+    // Hash includes tokens beyond capacity if any (defensive)
     for (int i = copy_len; i < len; i++) {
         h = h * HASH_BASE + (long long)src[i];
     }
-    // Zero remaining
-    for (int i = copy_len; i < max_expr_len; i++) {
+    // Zero remaining capacity
+    for (int i = copy_len; i < capacity; i++) {
         dst[i] = 0;
     }
 
@@ -227,23 +230,23 @@ __global__ void execute_assertion_kernel(
     int max_fhyps_batch,                            // width of fhyp_input_positions
     int max_ehyps_batch,                            // width of ehyp_input_positions
     // Assertion table (on device, shared across all levels)
-    const int* __restrict__ tbl_pattern_toks,       // [A, P_max]
+    const tok_t* __restrict__ tbl_pattern_toks,       // [A, P_max]
     const int* __restrict__ tbl_pattern_lengths,    // [A]
-    const int* __restrict__ tbl_fhyp_var_ids,       // [A, tbl_max_fhyps]
+    const tok_t* __restrict__ tbl_fhyp_var_ids,       // [A, tbl_max_fhyps]
     const int* __restrict__ tbl_fhyp_count,         // [A]
-    const int* __restrict__ tbl_ehyp_patterns,      // [A, tbl_max_ehyps, E_max]
+    const tok_t* __restrict__ tbl_ehyp_patterns,      // [A, tbl_max_ehyps, E_max]
     const int* __restrict__ tbl_ehyp_pattern_lengths, // [A, tbl_max_ehyps]
     const int* __restrict__ tbl_ehyp_count,         // [A]
     int P_max,
     int tbl_max_fhyps,
     int tbl_max_ehyps,
     int E_max,
-    // Global expression buffer
-    int* __restrict__ expr_buffer,                  // [total_nodes, max_expr_len]
+    // Global expression buffer (packed 1D)
+    tok_t* __restrict__ expr_buffer,                  // [total_expr_tokens] packed
     int* __restrict__ expr_lengths_buf,             // [total_nodes]
     long long* __restrict__ expr_hashes,            // [total_nodes]
     bool* __restrict__ node_failed,                 // [total_nodes]
-    int max_expr_len
+    const long long* __restrict__ expr_offsets      // [total_nodes+1]
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= B) return;
@@ -283,7 +286,7 @@ __global__ void execute_assertion_kernel(
     }
 
     // Pointer to this assertion's fhyp var IDs in the table
-    const int* my_var_ids = tbl_fhyp_var_ids + (long long)a_idx * tbl_max_fhyps;
+    const tok_t* my_var_ids = tbl_fhyp_var_ids + (long long)a_idx * tbl_max_fhyps;
 
     // ── (c) Check essential hypotheses ──────────────────────────────
     int n_ehyps = tbl_ehyp_count[a_idx];
@@ -291,7 +294,7 @@ __global__ void execute_assertion_kernel(
 
     for (int e = 0; e < n_ehyps && ehyps_ok; e++) {
         // Get ehyp pattern from table
-        const int* ehyp_pat = tbl_ehyp_patterns +
+        const tok_t* ehyp_pat = tbl_ehyp_patterns +
             ((long long)a_idx * tbl_max_ehyps + e) * E_max;
         int ehyp_pat_len = tbl_ehyp_pattern_lengths[
             (long long)a_idx * tbl_max_ehyps + e];
@@ -307,12 +310,12 @@ __global__ void execute_assertion_kernel(
         if (target_gi < 0) target_gi = 0;
 
         int target_len = expr_lengths_buf[target_gi];
-        const int* target_row = expr_buffer + (long long)target_gi * max_expr_len;
+        const tok_t* target_row = expr_buffer + expr_offsets[target_gi];
 
         bool match = stream_substitute_and_compare(
             ehyp_pat, ehyp_pat_len,
             my_var_ids, actual_fhyps,
-            expr_buffer, expr_lengths_buf, max_expr_len,
+            expr_buffer, expr_lengths_buf, expr_offsets,
             fhyp_gi,
             target_row, target_len
         );
@@ -321,12 +324,13 @@ __global__ void execute_assertion_kernel(
     }
 
     // ── (d) Compute and write conclusion ────────────────────────────
-    const int* my_pattern = tbl_pattern_toks + (long long)a_idx * P_max;
+    const tok_t* my_pattern = tbl_pattern_toks + (long long)a_idx * P_max;
     int my_pat_len = tbl_pattern_lengths[a_idx];
 
-    int* out_row = expr_buffer + (long long)out_gi * max_expr_len;
+    tok_t* out_row = expr_buffer + expr_offsets[out_gi];
+    int out_capacity = (int)(expr_offsets[out_gi + 1] - expr_offsets[out_gi]);
     // Zero the output row first
-    for (int i = 0; i < max_expr_len; i++) {
+    for (int i = 0; i < out_capacity; i++) {
         out_row[i] = 0;
     }
 
@@ -334,9 +338,9 @@ __global__ void execute_assertion_kernel(
     int out_len = stream_substitute_and_write(
         my_pattern, my_pat_len,
         my_var_ids, actual_fhyps,
-        expr_buffer, expr_lengths_buf, max_expr_len,
+        expr_buffer, expr_lengths_buf, expr_offsets,
         fhyp_gi,
-        out_row, &out_hash
+        out_row, &out_hash, out_capacity
     );
 
     expr_lengths_buf[out_gi] = out_len;
@@ -355,16 +359,16 @@ __global__ void execute_assertion_kernel(
 __global__ void final_check_kernel(
     int num_proofs,
     const int* __restrict__ final_node_indices,       // [num_proofs]
-    const int* __restrict__ expected_conclusions,      // [num_proofs, max_concl_stored]
+    const tok_t* __restrict__ expected_conclusions,      // [num_proofs, max_concl_stored]
     const int* __restrict__ conclusion_lengths,        // [num_proofs]
     const long long* __restrict__ expected_hashes,     // [num_proofs]
     int max_concl_stored,
-    // Global buffers
-    const int* __restrict__ expr_buffer,              // [total_nodes, max_expr_len]
+    // Global buffers (packed 1D)
+    const tok_t* __restrict__ expr_buffer,              // [total_expr_tokens] packed
     const int* __restrict__ expr_lengths_buf,         // [total_nodes]
     const long long* __restrict__ expr_hashes,        // [total_nodes]
     const bool* __restrict__ node_failed,             // [total_nodes]
-    int max_expr_len,
+    const long long* __restrict__ expr_offsets,        // [total_nodes+1]
     // Output
     bool* __restrict__ proof_passed                   // [num_proofs]
 ) {
@@ -385,33 +389,24 @@ __global__ void final_check_kernel(
         return;
     }
 
-    // If expression fits in buffer: token comparison (exact)
-    bool fits = (final_len <= max_expr_len);
+    // With packed buffer the expression is always fully stored.
+    // Token comparison is possible when expected_conclusions wasn't truncated.
+    bool fits = (final_len <= max_concl_stored);
     if (fits) {
-        const int* final_row = expr_buffer + (long long)final_gi * max_expr_len;
-        const int* expected_row = expected_conclusions + (long long)tid * max_concl_stored;
-        int cmp_len = final_len < max_concl_stored ? final_len : max_concl_stored;
+        const tok_t* final_row = expr_buffer + expr_offsets[final_gi];
+        const tok_t* expected_row = expected_conclusions + (long long)tid * max_concl_stored;
 
-        for (int i = 0; i < cmp_len; i++) {
+        for (int i = 0; i < final_len; i++) {
             if (final_row[i] != expected_row[i]) {
                 proof_passed[tid] = false;
                 return;
             }
         }
-        // If final_len > max_concl_stored, remaining tokens can't be checked
-        // via token comparison — fall through to hash
-        if (final_len > max_concl_stored) {
-            fits = false;
-        }
-    }
-
-    if (!fits) {
-        // Hash comparison
+        proof_passed[tid] = true;
+    } else {
+        // Hash comparison (expected conclusion was truncated at max_concl_stored)
         proof_passed[tid] = (final_hash == expected_hash);
-        return;
     }
-
-    proof_passed[tid] = true;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -426,20 +421,20 @@ void push_nodes_launch(
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
-    int max_expr_len
+    torch::Tensor expr_offsets
 ) {
     if (num_push == 0) return;
     int threads = 256;
     int blocks = (num_push + threads - 1) / threads;
     push_nodes_kernel<<<blocks, threads>>>(
         push_global_indices.data_ptr<int>(),
-        push_expressions.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(push_expressions.data_ptr<int16_t>()),
         push_expr_lengths.data_ptr<int>(),
         push_width, num_push,
-        expr_buffer.data_ptr<int>(),
+        reinterpret_cast<tok_t*>(expr_buffer.data_ptr<int16_t>()),
         expr_lengths_buf.data_ptr<int>(),
         reinterpret_cast<long long*>(expr_hashes.data_ptr<int64_t>()),
-        max_expr_len
+        reinterpret_cast<const long long*>(expr_offsets.data_ptr<int64_t>())
     );
 }
 
@@ -464,7 +459,7 @@ void execute_assertion_launch(
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
     torch::Tensor node_failed,
-    int max_expr_len
+    torch::Tensor expr_offsets
 ) {
     if (B == 0) return;
     int threads = 256;
@@ -478,19 +473,19 @@ void execute_assertion_launch(
         ehyp_input_positions.data_ptr<int>(),
         output_global_indices.data_ptr<int>(),
         max_inputs, max_fhyps_batch, max_ehyps_batch,
-        tbl_pattern_toks.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(tbl_pattern_toks.data_ptr<int16_t>()),
         tbl_pattern_lengths.data_ptr<int>(),
-        tbl_fhyp_var_ids.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(tbl_fhyp_var_ids.data_ptr<int16_t>()),
         tbl_fhyp_count.data_ptr<int>(),
-        tbl_ehyp_patterns.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(tbl_ehyp_patterns.data_ptr<int16_t>()),
         tbl_ehyp_pattern_lengths.data_ptr<int>(),
         tbl_ehyp_count.data_ptr<int>(),
         P_max, tbl_max_fhyps, tbl_max_ehyps, E_max,
-        expr_buffer.data_ptr<int>(),
+        reinterpret_cast<tok_t*>(expr_buffer.data_ptr<int16_t>()),
         expr_lengths_buf.data_ptr<int>(),
         reinterpret_cast<long long*>(expr_hashes.data_ptr<int64_t>()),
         node_failed.data_ptr<bool>(),
-        max_expr_len
+        reinterpret_cast<const long long*>(expr_offsets.data_ptr<int64_t>())
     );
 }
 
@@ -505,7 +500,7 @@ void final_check_launch(
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
     torch::Tensor node_failed,
-    int max_expr_len,
+    torch::Tensor expr_offsets,
     torch::Tensor proof_passed
 ) {
     if (num_proofs == 0) return;
@@ -514,15 +509,15 @@ void final_check_launch(
     final_check_kernel<<<blocks, threads>>>(
         num_proofs,
         final_node_indices.data_ptr<int>(),
-        expected_conclusions.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(expected_conclusions.data_ptr<int16_t>()),
         conclusion_lengths.data_ptr<int>(),
         reinterpret_cast<const long long*>(expected_hashes.data_ptr<int64_t>()),
         max_concl_stored,
-        expr_buffer.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(expr_buffer.data_ptr<int16_t>()),
         expr_lengths_buf.data_ptr<int>(),
         reinterpret_cast<const long long*>(expr_hashes.data_ptr<int64_t>()),
         node_failed.data_ptr<bool>(),
-        max_expr_len,
+        reinterpret_cast<const long long*>(expr_offsets.data_ptr<int64_t>()),
         proof_passed.data_ptr<bool>()
     );
 }
@@ -540,7 +535,7 @@ void push_nodes_launch(
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
-    int max_expr_len
+    torch::Tensor expr_offsets
 );
 
 void execute_assertion_launch(
@@ -564,7 +559,7 @@ void execute_assertion_launch(
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
     torch::Tensor node_failed,
-    int max_expr_len
+    torch::Tensor expr_offsets
 );
 
 void final_check_launch(
@@ -578,7 +573,7 @@ void final_check_launch(
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
     torch::Tensor node_failed,
-    int max_expr_len,
+    torch::Tensor expr_offsets,
     torch::Tensor proof_passed
 );
 """
@@ -604,7 +599,7 @@ def _try_compile():
     try:
         from torch.utils.cpp_extension import load_inline
         _compiled_module = load_inline(
-            name="mmgpu_cuda_kernels_v3",
+            name="mmgpu_cuda_kernels_v5",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -639,14 +634,15 @@ def get_module():
 
 def cuda_push_nodes(
     push_global_indices: np.ndarray,   # [num_push] int32
-    push_expressions: np.ndarray,      # [num_push, push_width] int32
+    push_expressions: np.ndarray,      # [num_push, push_width] int16
     push_expr_lengths: np.ndarray,     # [num_push] int32
-    expr_buffer: torch.Tensor,         # [total_nodes, max_expr_len] int32 on device
+    expr_buffer: torch.Tensor,         # [total_expr_tokens] int16 on device (packed 1D)
     expr_lengths: torch.Tensor,        # [total_nodes] int32 on device
     expr_hashes: torch.Tensor,         # [total_nodes] int64 on device
+    expr_offsets: torch.Tensor,        # [total_nodes+1] int64 on device
     device: torch.device,
 ) -> None:
-    """Launch push_nodes_kernel."""
+    """Launch push_nodes_kernel in chunks to avoid OOM on wide push arrays."""
     mod = get_module()
     assert mod is not None
 
@@ -655,19 +651,28 @@ def cuda_push_nodes(
         return
 
     push_width = push_expressions.shape[1]
-    max_expr_len = expr_buffer.shape[1]
 
-    # Upload push data (small, one-time per pipeline run)
-    gi_t = torch.from_numpy(push_global_indices).to(device)
-    ex_t = torch.from_numpy(push_expressions).to(device)
-    el_t = torch.from_numpy(push_expr_lengths).to(device)
+    # Chunk size: keep GPU upload < ~512 MB per chunk
+    # Each row = push_width * 2 bytes (int16)
+    bytes_per_row = push_width * 2
+    chunk_rows = max(1, (512 * 1024 * 1024) // bytes_per_row)
 
-    mod.push_nodes_launch(
-        gi_t, ex_t, el_t,
-        push_width, num_push,
-        expr_buffer, expr_lengths, expr_hashes,
-        max_expr_len,
-    )
+    for start in range(0, num_push, chunk_rows):
+        end = min(start + chunk_rows, num_push)
+        n = end - start
+
+        gi_t = torch.from_numpy(np.ascontiguousarray(push_global_indices[start:end])).to(device)
+        ex_t = torch.from_numpy(np.ascontiguousarray(push_expressions[start:end])).to(device)
+        el_t = torch.from_numpy(np.ascontiguousarray(push_expr_lengths[start:end])).to(device)
+
+        mod.push_nodes_launch(
+            gi_t, ex_t, el_t,
+            push_width, n,
+            expr_buffer, expr_lengths, expr_hashes,
+            expr_offsets,
+        )
+
+        del gi_t, ex_t, el_t
 
 
 def cuda_execute_level(
@@ -686,11 +691,12 @@ def cuda_execute_level(
     tbl_ehyp_patterns: torch.Tensor,
     tbl_ehyp_pattern_lengths: torch.Tensor,
     tbl_ehyp_count: torch.Tensor,
-    # Global buffers (on device)
+    # Global buffers (on device, packed 1D)
     expr_buffer: torch.Tensor,
     expr_lengths: torch.Tensor,
     expr_hashes: torch.Tensor,
     node_failed: torch.Tensor,
+    expr_offsets: torch.Tensor,
     device: torch.device,
 ) -> None:
     """Launch execute_assertion_kernel for a batch, respecting sublevel ordering."""
@@ -704,7 +710,6 @@ def cuda_execute_level(
     max_inputs = batch_input_global_indices.shape[1]
     max_fhyps_batch = batch_fhyp_input_positions.shape[1]
     max_ehyps_batch = batch_ehyp_input_positions.shape[1]
-    max_expr_len = expr_buffer.shape[1]
 
     P_max = tbl_pattern_toks.shape[1]
     tbl_max_fhyps = tbl_fhyp_var_ids.shape[1]
@@ -750,7 +755,7 @@ def cuda_execute_level(
             tbl_ehyp_patterns, tbl_ehyp_pattern_lengths, tbl_ehyp_count,
             P_max, tbl_max_fhyps, tbl_max_ehyps, E_max,
             expr_buffer, expr_lengths, expr_hashes, node_failed,
-            max_expr_len,
+            expr_offsets,
         )
         # Sync between sublevels to ensure writes are visible
         torch.cuda.synchronize(device)
@@ -758,13 +763,14 @@ def cuda_execute_level(
 
 def cuda_final_check(
     final_node_indices: np.ndarray,        # [num_proofs] int32
-    expected_conclusions: np.ndarray,       # [num_proofs, max_concl_stored] int32
+    expected_conclusions: np.ndarray,       # [num_proofs, max_concl_stored] int16
     conclusion_lengths: np.ndarray,         # [num_proofs] int32
     expected_hashes: np.ndarray,            # [num_proofs] int64
     expr_buffer: torch.Tensor,
     expr_lengths: torch.Tensor,
     expr_hashes: torch.Tensor,
     node_failed: torch.Tensor,
+    expr_offsets: torch.Tensor,
     device: torch.device,
 ) -> np.ndarray:
     """Launch final_check_kernel. Returns [num_proofs] bool numpy array."""
@@ -775,7 +781,6 @@ def cuda_final_check(
     if num_proofs == 0:
         return np.ones(0, dtype=np.bool_)
 
-    max_expr_len = expr_buffer.shape[1]
     max_concl_stored = expected_conclusions.shape[1]
 
     # Upload final check data
@@ -792,7 +797,7 @@ def cuda_final_check(
         fi_t, ec_t, cl_t, eh_t,
         max_concl_stored,
         expr_buffer, expr_lengths, expr_hashes, node_failed,
-        max_expr_len,
+        expr_offsets,
         proof_passed,
     )
 

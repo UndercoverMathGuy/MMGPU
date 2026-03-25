@@ -433,6 +433,12 @@ class GlobalPlan:
     # total_nodes) so that proof pi's node range is [offsets[pi], offsets[pi+1]).
     graph_offsets: np.ndarray  # [num_proofs+1] int64
 
+    # Pre-computed exact expression lengths for every node (packed buffer).
+    # Enables a compact 1D expr_buffer instead of padded 2D [N, max_expr_len].
+    # None when unavailable (torch fallback still uses padded layout).
+    node_expr_lengths: np.ndarray | None = None  # [total_nodes] int32
+    total_expr_tokens: int = 0  # sum(node_expr_lengths) — for budget sizing
+
 
 def pack_levels(
     graphs: list[ProofGraph],
@@ -549,11 +555,11 @@ def pack_levels(
               f"max_ehyps={global_max_ehyps}", flush=True)
 
     # Allocate and fill table arrays in one go using cached data.
-    tbl_pattern_toks          = np.zeros((A, global_max_pat_len),                     dtype=np.int32)
+    tbl_pattern_toks          = np.zeros((A, global_max_pat_len),                     dtype=np.int16)
     tbl_pattern_lengths       = np.zeros(A,                                            dtype=np.int32)
-    tbl_fhyp_var_ids          = np.zeros((A, global_max_fhyps),                       dtype=np.int32)
+    tbl_fhyp_var_ids          = np.zeros((A, global_max_fhyps),                       dtype=np.int16)
     tbl_fhyp_count            = np.zeros(A,                                            dtype=np.int32)
-    tbl_ehyp_patterns         = np.zeros((A, global_max_ehyps, global_max_ehyp_len),  dtype=np.int32)
+    tbl_ehyp_patterns         = np.zeros((A, global_max_ehyps, global_max_ehyp_len),  dtype=np.int16)
     tbl_ehyp_pattern_lengths  = np.zeros((A, global_max_ehyps),                       dtype=np.int32)
     tbl_ehyp_count            = np.zeros(A,                                            dtype=np.int32)
 
@@ -617,7 +623,7 @@ def pack_levels(
     max_push_width = max((g.max_push_expr_len for g in graphs), default=1)
     push_global_indices = np.empty(num_push, dtype=np.int32)
     push_expr_lengths   = np.empty(num_push, dtype=np.int32)
-    push_expressions    = np.zeros((num_push, max_push_width), dtype=np.int32)
+    push_expressions    = np.zeros((num_push, max_push_width), dtype=np.int16)
 
     for i, (pi, node) in enumerate(push_nodes):
         assert node.expression is not None
@@ -699,6 +705,100 @@ def pack_levels(
     # Free node collections — now packed into assertion_batches / push arrays
     del push_nodes, assertion_nodes_by_level, sorted_levels
 
+    # ── Pre-compute exact expression lengths (packed buffer) ─────────
+    # The substitution output length depends only on the assertion pattern
+    # structure and input expression lengths — NOT on token values.
+    # This lets us pre-allocate a tight 1D packed buffer on the GPU.
+    #
+    # For each assertion, precompute:
+    #   constant_count: number of non-variable tokens in pattern
+    #   var_occurrences[f]: how many times fhyp f's variable appears
+    # Then: output_len = constant_count + sum_f(var_occ[f] * (input_len[f] - 1))
+    tbl = assertion_table
+    _A = len(tbl.assertion_labels)
+    _max_f = tbl.fhyp_var_ids.shape[1] if _A > 0 else 0
+    _tbl_const_count = np.zeros(_A, dtype=np.int32)
+    _tbl_var_occ = np.zeros((_A, _max_f), dtype=np.int32)
+    for i in range(_A):
+        pl = int(tbl.pattern_lengths[i])
+        nf = int(tbl.fhyp_count[i])
+        cc = 0
+        for p in range(pl):
+            tok = tbl.pattern_toks[i, p]
+            matched = False
+            for f in range(nf):
+                if tok == tbl.fhyp_var_ids[i, f]:
+                    _tbl_var_occ[i, f] += 1
+                    matched = True
+                    break
+            if not matched:
+                cc += 1
+        _tbl_const_count[i] = cc
+
+    node_expr_lengths = np.zeros(total_nodes, dtype=np.int32)
+
+    # Push nodes: length is known directly
+    node_expr_lengths[push_global_indices] = push_expr_lengths
+
+    # Assertion nodes: level by level (respecting sublevel ordering)
+    for batch in assertion_batches:
+        if batch.sublevel_ranges is not None:
+            ranges = batch.sublevel_ranges
+        elif batch.level == batch.max_level:
+            ranges = [(0, batch.count)]
+        else:
+            nl = batch.node_levels
+            unique_lvls = np.unique(nl)
+            ranges = []
+            for lv in unique_lvls:
+                idxs = np.where(nl == lv)[0]
+                ranges.append((int(idxs[0]), int(idxs[-1]) + 1))
+
+        for sl_start, sl_end in ranges:
+            B_sl = sl_end - sl_start
+            if B_sl == 0:
+                continue
+            s = slice(sl_start, sl_end)
+            a_idxs = batch.assertion_idx[s]  # [B_sl]
+
+            out_lens = _tbl_const_count[a_idxs].copy()  # [B_sl]
+            n_fhyps_per = tbl.fhyp_count[a_idxs]  # [B_sl]
+            max_f_sl = int(n_fhyps_per.max()) if B_sl > 0 else 0
+            b_range = np.arange(B_sl)
+
+            for f in range(max_f_sl):
+                fhyp_valid = f < n_fhyps_per  # [B_sl] bool
+                if not fhyp_valid.any():
+                    continue
+                if f < batch.fhyp_input_positions.shape[1]:
+                    fhyp_pos = batch.fhyp_input_positions[s, f]  # [B_sl]
+                else:
+                    fhyp_pos = np.zeros(B_sl, dtype=np.int32)
+                max_in = batch.input_global_indices.shape[1]
+                fhyp_pos = np.clip(fhyp_pos, 0, max_in - 1)
+                input_gi = batch.input_global_indices[sl_start + b_range, fhyp_pos]
+                valid_in = input_gi >= 0
+                input_gi_safe = np.where(valid_in, input_gi, 0)
+                input_lens = node_expr_lengths[input_gi_safe]
+                input_lens = np.where(valid_in, input_lens, 0)
+                sub_lens = np.maximum(input_lens - 1, 0)  # skip type code
+                var_occ = _tbl_var_occ[a_idxs, f]  # [B_sl]
+                out_lens += np.where(fhyp_valid, var_occ * sub_lens, 0)
+
+            out_gis = batch.output_global_indices[s]
+            node_expr_lengths[out_gis] = out_lens
+
+    total_expr_tokens = int(node_expr_lengths.sum())
+    del _tbl_const_count, _tbl_var_occ
+
+    if verbose:
+        avg_len = total_expr_tokens / max(total_nodes, 1)
+        padded = total_nodes * max_expr_len
+        ratio = total_expr_tokens / max(padded, 1) * 100
+        print(f"  Phase 2: packed buffer: {total_expr_tokens:,} tokens "
+              f"(avg {avg_len:.1f}/node, {ratio:.1f}% of padded {padded:,})",
+              flush=True)
+
     # ── Final check data ─────────────────────────────────────────────
     # Cap the stored conclusion width to max_expr_len: conclusions longer
     # than the expr_buffer use rolling-hash comparison (not token comparison),
@@ -708,7 +808,7 @@ def pack_levels(
     num_proofs = len(graphs)
     max_concl_stored = max_expr_len
     final_node_indices         = np.zeros(num_proofs,                    dtype=np.int32)
-    expected_conclusions       = np.zeros((num_proofs, max_concl_stored), dtype=np.int32)
+    expected_conclusions       = np.zeros((num_proofs, max_concl_stored), dtype=np.int16)
     conclusion_lengths         = np.zeros(num_proofs,                    dtype=np.int32)
     expected_conclusion_hashes = np.zeros(num_proofs,                    dtype=np.int64)
     proof_theorem_labels: list[str] = []
@@ -717,7 +817,7 @@ def pack_levels(
         proof_theorem_labels.append(g.theorem_label)
         last_node = g.nodes[-1]
         final_node_indices[pi] = int(graph_offsets[pi]) + last_node.step_idx
-        enc = np.array(_enc(g.expected_conclusion), dtype=np.int32)
+        enc = np.array(_enc(g.expected_conclusion), dtype=np.int16)
         conclusion_lengths[pi] = len(enc)
         store_len = min(len(enc), max_concl_stored)
         expected_conclusions[pi, :store_len] = enc[:store_len]
@@ -741,6 +841,8 @@ def pack_levels(
         proof_theorem_labels=proof_theorem_labels,
         vocab_size=tokenizer.vocab_size(),
         graph_offsets=graph_offsets,
+        node_expr_lengths=node_expr_lengths,
+        total_expr_tokens=total_expr_tokens,
     )
 
 
@@ -757,15 +859,21 @@ _HASH_MASK = (1 << 63) - 1  # keep within signed int64 range
 
 
 def _poly_hash_np(tokens: np.ndarray) -> np.int64:
-    """Compute polynomial rolling hash of a 1-D int32 token array on CPU.
+    """Compute polynomial rolling hash of a 1-D token array on CPU.
+
+    Tokens may be int16 (wrapping values > 32767 to negative). We interpret
+    them as unsigned (matching CUDA's ``unsigned short``) by masking with
+    0xFFFF before adding to the hash.
 
     Uses Python int arithmetic (arbitrary precision) then masks to int64 so
     the result matches the GPU int64 wrap-around behaviour exactly.
     """
     base = int(_HASH_BASE)
+    is_i16 = tokens.dtype == np.int16
     h = 0
     for t in tokens:
-        h = (h * base + int(t)) & 0xFFFFFFFFFFFFFFFF
+        v = int(t) & 0xFFFF if is_i16 else int(t)
+        h = (h * base + v) & 0xFFFFFFFFFFFFFFFF
     # Reinterpret as signed int64
     if h >= (1 << 63):
         h -= (1 << 64)
@@ -773,11 +881,16 @@ def _poly_hash_np(tokens: np.ndarray) -> np.int64:
 
 
 def _poly_hash_gpu(
-    tokens: torch.Tensor,       # [B, L] int32 — possibly padded
+    tokens: torch.Tensor,       # [B, L] int16 — possibly padded
     lengths: torch.Tensor,      # [B] int32
     device: torch.device,
 ) -> torch.Tensor:              # [B] int64
-    """Compute polynomial rolling hash of variable-length token rows on GPU."""
+    """Compute polynomial rolling hash of variable-length token rows on GPU.
+
+    Tokens are stored as int16 (wrapping values > 32767 to negative).
+    We mask with 0xFFFF to recover unsigned values, matching the CUDA
+    kernel's ``unsigned short`` interpretation.
+    """
     B, L = tokens.shape
     # Only iterate up to the actual longest row — skip trailing padding.
     # For set.mm with max_expr_len=1024 but typical lengths ~100-200,
@@ -787,8 +900,8 @@ def _poly_hash_gpu(
     if actual_L == 0:
         return h
     base = torch.tensor(_HASH_BASE, dtype=torch.int64, device=device)
-    # Convert tokens to int64 once upfront instead of per-iteration
-    tokens_long = tokens[:, :actual_L].long()
+    # Interpret as unsigned uint16 via mask, then promote to int64
+    tokens_long = (tokens[:, :actual_L].int() & 0xFFFF).long()
     valid = torch.arange(actual_L, device=device).unsqueeze(0) < lengths.long().unsqueeze(1)
     for i in range(actual_L):
         h = torch.where(valid[:, i], h * base + tokens_long[:, i], h)
@@ -814,7 +927,7 @@ def _apply_substitution_compact(
     Variable tokens are looked up in the compact table via broadcasting match.
 
     Returns:
-        output: [B, max_output_len] int32 on device
+        output: [B, max_output_len] int16 on device
         output_lengths: [B] int32 on device
     """
     B = patterns.shape[0]
@@ -823,7 +936,7 @@ def _apply_substitution_compact(
     S_max = var_sub_values.shape[2]
 
     if B == 0:
-        return (torch.empty(0, 0, dtype=torch.int32, device=device),
+        return (torch.empty(0, 0, dtype=torch.int16, device=device),
                 torch.empty(0, dtype=torch.int32, device=device))
 
     # STEP 1: Match pattern tokens against variable IDs.
@@ -858,7 +971,7 @@ def _apply_substitution_compact(
     max_output_len = int(total_lengths.max().item()) if B > 0 else 0
 
     if max_output_len == 0:
-        return (torch.zeros(B, 1, dtype=torch.int32, device=device),
+        return (torch.zeros(B, 1, dtype=torch.int16, device=device),
                 torch.zeros(B, dtype=torch.int32, device=device))
 
     # STEP 4: SCATTER — fully vectorized (no Python position loop).
@@ -866,7 +979,7 @@ def _apply_substitution_compact(
     # of length ~200 meant 200 Python iterations × 3-4 GPU kernel launches
     # each = ~600-800 kernel launches. Now replaced with two vectorized
     # scatter operations (constants + variables).
-    output = torch.zeros(B, max_output_len, dtype=torch.int32, device=device)
+    output = torch.zeros(B, max_output_len, dtype=torch.int16, device=device)
     step_base = torch.arange(B, device=device, dtype=torch.long) * max_output_len
     output_flat = output.view(-1)
 
@@ -1265,11 +1378,12 @@ def _run_gpu_pipeline_cuda(
     max_expr_len: int,
     verbose: bool = False,
 ) -> tuple[np.ndarray, bool, int]:
-    """CUDA kernel path — zero intermediate GPU allocations.
+    """CUDA kernel path — packed 1D expr_buffer, zero intermediate allocations.
 
-    Same semantics as _run_gpu_pipeline but uses custom CUDA kernels that
-    stream-substitute in registers instead of materializing intermediate
-    tensors. Memory = expr_buffer + tracking arrays + assertion table.
+    Uses pre-computed node_expr_lengths to build a compact 1D packed buffer
+    instead of the padded 2D [total_nodes, max_expr_len] layout.  Each node
+    gets exactly the capacity it needs (from the CPU pre-pass), so there is
+    never any intermediate truncation.
 
     Returns:
         (per_proof_passed, had_intermediate_truncation, max_intermediate_len)
@@ -1279,11 +1393,28 @@ def _run_gpu_pipeline_cuda(
     if total_nodes == 0:
         return np.ones(plan.num_proofs, dtype=np.bool_), False, 0
 
-    # ── Allocate GPU buffers (the ONLY large allocations) ─────────
-    expr_buffer  = torch.empty(total_nodes, max_expr_len, dtype=torch.int32, device=device)
+    # ── Compute offsets from pre-pass lengths ─────────────────────
+    assert plan.node_expr_lengths is not None, "packed buffer requires node_expr_lengths"
+    offsets_np = np.empty(total_nodes + 1, dtype=np.int64)
+    offsets_np[0] = 0
+    np.cumsum(plan.node_expr_lengths, out=offsets_np[1:])
+    total_tokens = int(offsets_np[total_nodes])
+
+    # ── Allocate GPU buffers ──────────────────────────────────────
+    # expr_buffer is now 1D packed: each node's tokens are at
+    # expr_buffer[offsets[gi] : offsets[gi+1]]
+    expr_buffer  = torch.empty(max(total_tokens, 1), dtype=torch.int16, device=device)
     expr_lengths = torch.zeros(total_nodes, dtype=torch.int32, device=device)
     expr_hashes  = torch.zeros(total_nodes, dtype=torch.int64, device=device)
     node_failed  = torch.zeros(total_nodes, dtype=torch.bool,  device=device)
+    expr_offsets = torch.from_numpy(offsets_np).to(device)
+
+    if verbose:
+        packed_mb = total_tokens * 2 / 1024**2
+        padded_mb = total_nodes * max_expr_len * 2 / 1024**2
+        print(f"    Packed buffer: {packed_mb:.1f} MB "
+              f"(vs {padded_mb:.1f} MB padded, "
+              f"{packed_mb / max(padded_mb, 0.001) * 100:.1f}%)", flush=True)
 
     # ── Level 0: push nodes via CUDA kernel ───────────────────────
     if len(plan.push_global_indices) > 0:
@@ -1292,6 +1423,7 @@ def _run_gpu_pipeline_cuda(
             plan.push_expressions,
             plan.push_expr_lengths,
             expr_buffer, expr_lengths, expr_hashes,
+            expr_offsets,
             device,
         )
         torch.cuda.synchronize(device)
@@ -1349,6 +1481,7 @@ def _run_gpu_pipeline_cuda(
             tbl_fhyp_var_ids_t, tbl_fhyp_count_t,
             tbl_ehyp_patterns_t, tbl_ehyp_pattern_lengths_t, tbl_ehyp_count_t,
             expr_buffer, expr_lengths, expr_hashes, node_failed,
+            expr_offsets,
             device,
         )
 
@@ -1360,13 +1493,10 @@ def _run_gpu_pipeline_cuda(
             )
             print(f"    Level {lvl_str}: {batch.count} nodes in {dt:.3f}s (CUDA)", flush=True)
 
-    # ── Check for intermediate truncation ────────────────────────────
-    final_mask = torch.zeros(plan.total_nodes, dtype=torch.bool, device=device)
-    final_idx_t = torch.from_numpy(plan.final_node_indices).long().to(device)
-    final_mask[final_idx_t] = True
-    intermediate_lens = expr_lengths.masked_fill(final_mask, 0)
-    max_intermediate = int(intermediate_lens.max().item())
-    had_intermediate_truncation = max_intermediate > max_expr_len
+    # ── No intermediate truncation with packed buffer ─────────────
+    # Each node has exactly the capacity it needs from the CPU pre-pass.
+    had_intermediate_truncation = False
+    max_intermediate = 0
 
     # ── Final check via CUDA kernel ──────────────────────────────────
     proof_passed_np = _cuda_mod.cuda_final_check(
@@ -1375,6 +1505,7 @@ def _run_gpu_pipeline_cuda(
         plan.conclusion_lengths,
         plan.expected_conclusion_hashes,
         expr_buffer, expr_lengths, expr_hashes, node_failed,
+        expr_offsets,
         device,
     )
 
@@ -1416,7 +1547,7 @@ def _run_gpu_pipeline(
     # by either push-node writes (level 0) or assertion-node writes
     # (which zero + write via expr_buffer[c_out_idx] = 0 then assign).
     # For set.mm, this saves zeroing ~24 GB of GPU memory.
-    expr_buffer  = torch.empty(total_nodes, max_expr_len, dtype=torch.int32, device=device)
+    expr_buffer  = torch.empty(total_nodes, max_expr_len, dtype=torch.int16, device=device)
     expr_lengths = torch.zeros(total_nodes, dtype=torch.int32, device=device)
     expr_hashes  = torch.zeros(total_nodes, dtype=torch.int64, device=device)
     node_failed  = torch.zeros(total_nodes, dtype=torch.bool,  device=device)
@@ -1587,7 +1718,7 @@ def warmup_cuda(device: torch.device) -> None:
     B, S, P, F = 8, 4, 8, 2  # tiny synthetic shapes
 
     # Allocate
-    expr_buf  = torch.zeros(B * 2, P, dtype=torch.int32, device=device)
+    expr_buf  = torch.zeros(B * 2, P, dtype=torch.int16, device=device)
     expr_lens = torch.zeros(B * 2, dtype=torch.int32, device=device)
     failed    = torch.zeros(B * 2, dtype=torch.bool, device=device)
 
@@ -1595,14 +1726,14 @@ def warmup_cuda(device: torch.device) -> None:
     in_idx    = torch.zeros(B, 2, dtype=torch.long, device=device)
     in_count  = torch.ones(B, dtype=torch.int32, device=device)
 
-    pat       = torch.ones(B, P, dtype=torch.int32, device=device)
+    pat       = torch.ones(B, P, dtype=torch.int16, device=device)
     pat_len   = torch.full((B,), P, dtype=torch.int32, device=device)
 
     fhyp_var  = torch.zeros(B, F, dtype=torch.long, device=device)
     fhyp_cnt  = torch.ones(B, dtype=torch.int32, device=device)
     fhyp_valid = torch.arange(F, device=device) < fhyp_cnt.unsqueeze(1)
 
-    var_sub_vals = torch.zeros(B, F, S, dtype=torch.int32, device=device)
+    var_sub_vals = torch.zeros(B, F, S, dtype=torch.int16, device=device)
     var_sub_lens = torch.ones(B, F, dtype=torch.int32, device=device)
 
     # Kernels used in _execute_level ─────────────────────────────────
@@ -1733,6 +1864,17 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
     go_b = plan.graph_offsets[split:].copy() - offset_split  # rebase to 0
     go_b = go_b.astype(np.int64)
 
+    # node_expr_lengths: split by node range
+    nel_a: np.ndarray | None = None
+    nel_b: np.ndarray | None = None
+    tet_a = 0
+    tet_b = 0
+    if plan.node_expr_lengths is not None:
+        nel_a = plan.node_expr_lengths[:offset_split].copy()
+        nel_b = plan.node_expr_lengths[offset_split:].copy()
+        tet_a = int(nel_a.sum())
+        tet_b = int(nel_b.sum())
+
     plan_a = GlobalPlan(
         total_nodes=total_nodes_a,
         max_expr_len=plan.max_expr_len,
@@ -1749,6 +1891,8 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
         proof_theorem_labels=labels_a,
         vocab_size=plan.vocab_size,
         graph_offsets=go_a,
+        node_expr_lengths=nel_a,
+        total_expr_tokens=tet_a,
     )
     plan_b = GlobalPlan(
         total_nodes=total_nodes_b,
@@ -1766,6 +1910,8 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
         proof_theorem_labels=labels_b,
         vocab_size=plan.vocab_size,
         graph_offsets=go_b,
+        node_expr_lengths=nel_b,
+        total_expr_tokens=tet_b,
     )
     return plan_a, plan_b
 
@@ -1941,32 +2087,78 @@ def _verify_proofs_gpu_batched(
     else:
         free_bytes = 8 * 1024 ** 3  # 8 GB fallback for non-CUDA
 
-    bytes_per_node = plan.max_expr_len * 4  # int32 tokens
-    # Also account for expr_lengths, expr_hashes, node_failed (~13 bytes/node)
-    bytes_per_node += 13
-    nodes_per_batch = max(1, int(free_bytes * VRAM_BUDGET_FRACTION / bytes_per_node))
+    # ── Budget: CUDA packed path uses exact token counts ────────────
+    # With packed buffer, total bytes = total_expr_tokens*2 + nodes*21
+    # (21 = expr_lengths(4) + expr_hashes(8) + node_failed(1) + expr_offsets(8)).
+    # No 2× safety margin needed: packed buffer never truncates/retries.
+    # Torch fallback still uses per-node padded budget.
+    use_packed = (device.type == "cuda" and _cuda_mod.is_available()
+                  and plan.node_expr_lengths is not None)
 
-    if verbose:
-        free_gb = free_bytes / 1024**3
-        batch_gb = nodes_per_batch * bytes_per_node / 1024**3
-        print(
-            f"  Phase 3: {free_gb:.1f} GB free VRAM, "
-            f"~{batch_gb:.1f} GB per batch, "
-            f"{nodes_per_batch:,} nodes/batch",
-            flush=True,
-        )
+    vram_budget = int(free_bytes * VRAM_BUDGET_FRACTION)
 
-    # Build batch split points by node count using graph_offsets
-    split_points: list[int] = [0]
-    while split_points[-1] < N:
-        prev = split_points[-1]
-        target_nodes = int(plan.graph_offsets[prev]) + nodes_per_batch
-        # Find first proof index whose start offset >= target_nodes
-        pi = int(np.searchsorted(plan.graph_offsets, target_nodes, side='left'))
-        pi = min(pi, N)
-        if pi <= prev:
-            pi = prev + 1  # always advance at least one proof
-        split_points.append(pi)
+    if use_packed:
+        # Precompute cumulative token counts per proof boundary for split search
+        cum_tokens_at_proof = np.zeros(N + 1, dtype=np.int64)
+        nel = plan.node_expr_lengths
+        go = plan.graph_offsets
+        for pi in range(N):
+            n_start = int(go[pi])
+            n_end = int(go[pi + 1])
+            cum_tokens_at_proof[pi + 1] = cum_tokens_at_proof[pi] + int(nel[n_start:n_end].sum())
+
+        if verbose:
+            free_gb = free_bytes / 1024**3
+            total_mb = (plan.total_expr_tokens * 2 + plan.total_nodes * 21) / 1024**2
+            print(
+                f"  Phase 3: {free_gb:.1f} GB free VRAM, "
+                f"packed buffer needs {total_mb:.1f} MB",
+                flush=True,
+            )
+
+        # Build split points: greedily add proofs until VRAM budget is exceeded
+        split_points: list[int] = [0]
+        while split_points[-1] < N:
+            prev = split_points[-1]
+            prev_tokens = int(cum_tokens_at_proof[prev])
+            prev_nodes = int(go[prev])
+            # Binary search for the last proof that fits
+            lo, hi = prev + 1, N
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                shard_tokens = int(cum_tokens_at_proof[mid]) - prev_tokens
+                shard_nodes = int(go[mid]) - prev_nodes
+                shard_bytes = shard_tokens * 2 + shard_nodes * 21
+                if shard_bytes <= vram_budget:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            split_points.append(lo)
+    else:
+        budget_expr_len = min(plan.max_expr_len * 2, _MAX_EXPR_LEN_CAP)
+        bytes_per_node = budget_expr_len * 2 + 13  # int16 tokens + tracking
+        nodes_per_batch = max(1, vram_budget // bytes_per_node)
+
+        if verbose:
+            free_gb = free_bytes / 1024**3
+            batch_gb = nodes_per_batch * bytes_per_node / 1024**3
+            print(
+                f"  Phase 3: {free_gb:.1f} GB free VRAM, "
+                f"~{batch_gb:.1f} GB per batch, "
+                f"{nodes_per_batch:,} nodes/batch",
+                flush=True,
+            )
+
+        # Build batch split points by node count using graph_offsets
+        split_points = [0]
+        while split_points[-1] < N:
+            prev = split_points[-1]
+            target_nodes = int(plan.graph_offsets[prev]) + nodes_per_batch
+            pi = int(np.searchsorted(plan.graph_offsets, target_nodes, side='left'))
+            pi = min(pi, N)
+            if pi <= prev:
+                pi = prev + 1
+            split_points.append(pi)
 
     num_batches = len(split_points) - 1
     if verbose:

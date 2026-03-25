@@ -194,14 +194,18 @@ class TestCudaMemory:
         _run_gpu_pipeline_cuda(plan, device, plan.max_expr_len, verbose=False)
 
         peak_bytes = torch.cuda.max_memory_allocated(device)
-        # Expected: expr_buffer + tracking + assertion table
-        # expr_buffer: total_nodes × max_expr_len × 4
-        # tracking: total_nodes × 13
-        # assertion table: small relative to expr_buffer
-        expected_base = plan.total_nodes * (plan.max_expr_len * 4 + 13)
-        # Allow 2x for assertion table + small temporaries
-        assert peak_bytes < expected_base * 2, (
+        # Expected: packed expr_buffer + tracking + assertion table + offsets
+        # expr_buffer: total_expr_tokens × 2 (int16, packed 1D)
+        # tracking: total_nodes × (4 + 8 + 1) = 13 bytes
+        # offsets: (total_nodes + 1) × 8 bytes
+        expected_base = (
+            plan.total_expr_tokens * 2  # packed expr_buffer
+            + plan.total_nodes * 13     # tracking arrays
+            + (plan.total_nodes + 1) * 8  # expr_offsets
+        )
+        # Allow 3x for assertion table + upload temporaries
+        assert peak_bytes < expected_base * 3, (
             f"Peak GPU memory {peak_bytes / 1e9:.2f} GB exceeds "
-            f"2x expected base {expected_base * 2 / 1e9:.2f} GB — "
+            f"3x expected base {expected_base * 3 / 1e9:.2f} GB — "
             f"intermediate allocations may be leaking"
         )
