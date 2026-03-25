@@ -1983,15 +1983,21 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
     Walks the proof stack exactly like a standard Metamath verifier but only
     checks disjoint variable conditions — the GPU has already validated the
     substitution arithmetic.  Returns True if all $d constraints are satisfied.
+
+    The Metamath $d rule: when applying an assertion with $d x y, for every
+    variable v in subst(x) and every variable w in subst(y), the pair (v, w)
+    must appear in the active $d constraints of the theorem being proved
+    (assertion.all_disjoint_vars). Additionally v != w is required.
     """
     assertion = parsed.assertions[theorem_label]
     variables = parsed.variables
+    # Active $d pairs for this proof context — stored as a set of frozensets
+    # so (v, w) and (w, v) both match.
+    active_dv: set[frozenset] = {frozenset(p) for p in assertion.all_disjoint_vars}
 
-    # Build label → info lookup (floating hyp, essential hyp, or assertion)
     def _info(lbl: str):
         if lbl in parsed.floating_hyps:
-            fh = parsed.floating_hyps[lbl]
-            return ("$f", fh)
+            return ("$f", parsed.floating_hyps[lbl])
         if lbl in parsed.essential_hyps:
             return ("$e", parsed.essential_hyps[lbl])
         if lbl in parsed.assertions:
@@ -2006,10 +2012,13 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
         if info is None:
             return False
         kind, data = info
-        if kind in ("$f", "$e"):
-            stack.append(list(data.expression) if kind == "$e" else [data.type_code, data.variable])
+        if kind == "$f":
+            stack.append([data.type_code, data.variable])
             return True
-        # Assertion: pop hypotheses, build substitution, check $d, push conclusion
+        if kind == "$e":
+            stack.append(list(data.expression))
+            return True
+        # Assertion step: pop hyps, build substitution, check $d, push conclusion
         a = data
         n_pop = len(a.floating_hyps) + len(a.essential_hyps)
         if len(stack) < n_pop:
@@ -2021,12 +2030,16 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
             entry = stack[sp]
             subst[fh.variable] = entry[1:]  # strip type code
             sp += 1
-        # Check $d: for each (x, y) pair, subst[x] and subst[y] must share no vars
+        # $d check: for each mandatory $d x y on the applied assertion,
+        # every variable in subst(x) must be disjoint (in active_dv) from
+        # every variable in subst(y), and they must be distinct variables.
         for x, y in a.disjoint_vars:
             sx = _vars_in_expr(subst.get(x, [x]), variables)
             sy = _vars_in_expr(subst.get(y, [y]), variables)
-            if sx & sy:
-                return False
+            for v in sx:
+                for w in sy:
+                    if v == w or frozenset((v, w)) not in active_dv:
+                        return False
         del stack[len(stack) - n_pop:]
         stack.append(_apply_subst(a.expression, subst))
         return True
@@ -2055,7 +2068,8 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
                     return False
         else:
             return True  # axiom — no proof to check
-    except Exception:
+    except Exception as e:
+        print(f"  [DV] EXCEPTION in {theorem_label}: {e}", flush=True)
         return False
 
     return True
