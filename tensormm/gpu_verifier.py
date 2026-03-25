@@ -2362,9 +2362,10 @@ def verify_database(
     # ── Phase 2: Level packing ───────────────────────────────────
     t1 = time.perf_counter()
     tokenizer = Tokenizer()
-    for c in parsed.constants:
+    # Sort to ensure deterministic token ID assignment
+    for c in sorted(parsed.constants):
         tokenizer.encode_symbol(c)
-    for v in parsed.variables:
+    for v in sorted(parsed.variables):
         tokenizer.encode_symbol(v)
 
     plan = pack_levels(graphs, parsed, tokenizer, verbose=verbose)
