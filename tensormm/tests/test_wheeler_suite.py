@@ -47,6 +47,7 @@ def _knife_verify(mm_path: str) -> bool:
         capture_output=True,
         text=True,
         timeout=300,
+        cwd=os.path.dirname(os.path.abspath(mm_path)),
     )
     return r.returncode == 0
 
