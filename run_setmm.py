@@ -78,8 +78,8 @@ if __name__ == '__main__':
     gpu_results = verify_database(parsed, theorems, device=device, verbose=True)
     t_total = time.perf_counter() - t_total_0
 
-    gpu_pass = sum(1 for v in gpu_results.values() if v)
-    gpu_fail = sum(1 for v in gpu_results.values() if not v)
+    gpu_pass = sum(1 for v in gpu_results.values() if v is None)
+    gpu_fail = sum(1 for v in gpu_results.values() if v is not None)
 
     # ── Summary ────────────────────────────────────────────────────────
     print(f"\n{'═' * 60}")
@@ -100,6 +100,12 @@ if __name__ == '__main__':
 
     if gpu_fail:
         print(f"\nFATAL: {gpu_fail} GPU verification failures — kernel is UNSOUND")
+        # Show up to 20 failures with their reasons
+        failures = [(lbl, r) for lbl, r in gpu_results.items() if r is not None]
+        for lbl, reason in failures[:20]:
+            print(f"  FAIL [{lbl}]: {reason}")
+        if len(failures) > 20:
+            print(f"  ... and {len(failures) - 20} more")
         sys.exit(1)
     else:
         print(f"\nSUCCESS: All {gpu_pass:,} theorems verified correctly.")

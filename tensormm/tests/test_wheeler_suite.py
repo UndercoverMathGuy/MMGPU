@@ -52,6 +52,34 @@ def _knife_verify(mm_path: str) -> bool:
     return r.returncode == 0
 
 
+# Maps knife diagnostic heading text → short key
+_KNIFE_DIAGNOSTICS = {
+    "Proof does not end with a single statement": "ProofExcessEnd",
+    "Proof underflow":                            "ProofUnderflow",
+    "Wrong essential typecode":                   "StepEssenWrongType",
+    "Wrong essential statement":                  "StepEssenWrong",
+    "Distinct variable violation":                "ProofDvViolation",
+}
+
+
+def _knife_diagnostic(mm_path: str) -> str | None:
+    """Run knife and return the first diagnostic key, or None if it passes."""
+    r = subprocess.run(
+        [_knife_bin(), "--verify", mm_path],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        cwd=os.path.dirname(os.path.abspath(mm_path)),
+    )
+    if r.returncode == 0:
+        return None
+    output = r.stdout + r.stderr
+    for text, key in _KNIFE_DIAGNOSTICS.items():
+        if text in output:
+            return key
+    return "unknown"
+
+
 def _verify_gpu(parsed: ParsedDatabase) -> tuple[int, int, str]:
     """Run GPU verification on all theorems.
 
@@ -155,37 +183,52 @@ class TestWheelerPass:
 
 # ── Files that SHOULD FAIL ──────────────────────────────────────────
 
-class TestWheelerFail:
-    """Files with deliberately broken proofs — both knife AND GPU must reject."""
+# (filename, knife_diagnostic_key, gpu_reason_prefix)
+#
+# knife_diagnostic_key: key emitted by _knife_diagnostic()
+# gpu_reason_prefix: expected prefix of GPU failure reason from verify_database()
+#   "graph:" — caught at graph construction (stack underflow / excess entries)
+#   "ehyp_mismatch" — CUDA kernel essential-hyp check failed
+#   "dv:"    — $d disjoint-variable constraint violated
+_WHEELER_BAD = [
+    ("anatomy-bad1.mm",     "ProofExcessEnd",     "graph:"),
+    ("anatomy-bad2.mm",     "ProofExcessEnd",     "graph:"),
+    ("anatomy-bad3.mm",     "ProofUnderflow",     "graph:"),
+    ("big-unifier-bad1.mm", "StepEssenWrongType", "ehyp_mismatch"),
+    ("big-unifier-bad2.mm", "ProofExcessEnd",     "graph:"),
+    ("big-unifier-bad3.mm", "StepEssenWrongType", "ehyp_mismatch"),
+    ("demo0-bad1.mm",       "StepEssenWrong",     "ehyp_mismatch"),
+    ("set-dist-bad1.mm",    "ProofDvViolation",   "dv:"),
+]
 
-    @pytest.mark.parametrize("filename,description", [
-        ("anatomy-bad1.mm",     "wrong proof step"),
-        ("anatomy-bad2.mm",     "too few proof steps"),
-        ("anatomy-bad3.mm",     "missing first step"),
-        ("big-unifier-bad1.mm", "wrong unification"),
-        ("big-unifier-bad2.mm", "extra proof steps"),
-        ("big-unifier-bad3.mm", "wrong substitution"),
-        ("demo0-bad1.mm",       "reordered proof steps"),
-        ("set-dist-bad1.mm",    "removed $d constraint"),
-    ])
-    def test_knife_rejects(self, filename: str, description: str) -> None:
-        """metamath-knife must reject this deliberately broken file."""
+
+class TestWheelerFail:
+    """Files with deliberately broken proofs — knife AND GPU must both reject,
+    and must agree on the root cause."""
+
+    @pytest.mark.parametrize("filename,knife_diag,_gpu_reason", _WHEELER_BAD)
+    def test_knife_rejects(self, filename: str, knife_diag: str, _gpu_reason: str) -> None:
+        """metamath-knife must reject the file with the expected diagnostic."""
         path = _skip_if_missing(filename)
-        assert not _knife_verify(path), (
-            f"{filename} ({description}) should FAIL but knife accepted it"
+        diag = _knife_diagnostic(path)
+        assert diag is not None, (
+            f"{filename} should FAIL but knife accepted it"
+        )
+        assert diag == knife_diag, (
+            f"{filename}: knife emitted {diag!r}, expected {knife_diag!r}"
         )
 
-    @pytest.mark.parametrize("filename,description", [
-        ("anatomy-bad1.mm",     "wrong proof step"),
-        ("anatomy-bad2.mm",     "too few proof steps"),
-        ("anatomy-bad3.mm",     "missing first step"),
-        ("big-unifier-bad1.mm", "wrong unification"),
-        ("big-unifier-bad2.mm", "extra proof steps"),
-        ("big-unifier-bad3.mm", "wrong substitution"),
-        ("demo0-bad1.mm",       "reordered proof steps"),
-    ])
-    def test_gpu_rejects(self, filename: str, description: str) -> None:
-        """GPU verifier must reject at least one theorem in this broken file."""
+    @pytest.mark.parametrize("filename,knife_diag,gpu_reason", _WHEELER_BAD)
+    def test_gpu_rejects_with_reason(
+        self, filename: str, knife_diag: str, gpu_reason: str
+    ) -> None:
+        """GPU verifier must reject broken files and report the same root cause as knife.
+
+        GPU failure reason must start with the expected prefix matching knife's diagnostic:
+          ProofExcessEnd / ProofUnderflow → "graph:" (caught at graph construction)
+          StepEssenWrongType / StepEssenWrong → "ehyp_mismatch"
+          ProofDvViolation → "dv:"
+        """
         path = _skip_if_missing(filename)
         try:
             parsed = parse_mm_file(path)
@@ -194,9 +237,48 @@ class TestWheelerFail:
         theorems = [k for k, v in parsed.assertions.items() if v.type == "theorem"]
         if not theorems:
             pytest.skip(f"{filename} has no theorems")
-        _, n_fail, detail = _verify_gpu(parsed)
-        assert n_fail > 0, (
-            f"{filename} ({description}): GPU accepted all theorems but should have failed"
+        results = verify_database(parsed, theorem_labels=theorems)
+        failures = {lbl: r for lbl, r in results.items() if r is not None}
+        assert failures, (
+            f"{filename}: GPU accepted all theorems but should have failed "
+            f"(knife: {knife_diag!r})"
+        )
+        wrong = {lbl: r for lbl, r in failures.items() if not r.startswith(gpu_reason)}
+        assert not wrong, (
+            f"{filename}: expected all GPU failures to start with {gpu_reason!r} "
+            f"(knife: {knife_diag!r}), got: {wrong}"
+        )
+        gc.collect()
+
+    @pytest.mark.parametrize("filename,knife_diag,gpu_reason", _WHEELER_BAD)
+    def test_knife_gpu_agree_on_failure(
+        self, filename: str, knife_diag: str, gpu_reason: str
+    ) -> None:
+        """knife and GPU must agree: both reject, same root cause category."""
+        path = _skip_if_missing(filename)
+        knife_diag_actual = _knife_diagnostic(path)
+        assert knife_diag_actual is not None, (
+            f"{filename}: knife accepted the file — expected rejection"
+        )
+        assert knife_diag_actual == knife_diag, (
+            f"{filename}: knife diagnostic {knife_diag_actual!r} != expected {knife_diag!r}"
+        )
+        try:
+            parsed = parse_mm_file(path)
+        except Exception:
+            return
+        theorems = [k for k, v in parsed.assertions.items() if v.type == "theorem"]
+        if not theorems:
+            pytest.skip(f"{filename} has no theorems")
+        results = verify_database(parsed, theorem_labels=theorems)
+        failures = {lbl: r for lbl, r in results.items() if r is not None}
+        assert failures, (
+            f"{filename}: knife={knife_diag_actual!r} but GPU passed everything"
+        )
+        wrong = {lbl: r for lbl, r in failures.items() if not r.startswith(gpu_reason)}
+        assert not wrong, (
+            f"{filename}: knife={knife_diag_actual!r} → expected GPU reason prefix "
+            f"{gpu_reason!r}, got: {wrong}"
         )
         gc.collect()
 
