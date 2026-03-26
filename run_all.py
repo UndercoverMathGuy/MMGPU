@@ -40,9 +40,9 @@ if __name__ == "__main__":
     )
     results.append(("set.mm verification", ok))
 
-    # 2. CUDA kernel correctness tests (demo0, ql equivalence + memory)
+    # 2. CUDA kernel correctness tests (vs knife oracle + memory)
     ok = _run(
-        "CUDA kernel tests (demo0, ql, anatomy)",
+        "CUDA kernel tests (vs knife + memory)",
         [sys.executable, "-m", "pytest", "-xvs",
          "tensormm/tests/test_cuda_kernels.py"],
     )

@@ -2,7 +2,6 @@
 
 Tests run on CUDA GPU only (skipped if unavailable).  Full-pipeline tests
 compare the CUDA path against metamath-knife as the ground-truth oracle.
-Torch-path vs CUDA-path equivalence tests remain as internal consistency checks.
 """
 from __future__ import annotations
 
@@ -10,7 +9,6 @@ import os
 import subprocess
 import shutil
 
-import numpy as np
 import pytest
 import torch
 
@@ -18,7 +16,6 @@ from tensormm.gpu_verifier import (
     build_all_proof_graphs,
     pack_levels,
     verify_database,
-    _run_gpu_pipeline,
     _run_gpu_pipeline_cuda,
 )
 from tensormm.parser import parse_mm_file
@@ -44,9 +41,10 @@ def _build_plan(parsed, theorems=None):
     if theorems is None:
         theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
     tokenizer = Tokenizer()
-    for c in parsed.constants:
+    # Sort to ensure deterministic token ID assignment
+    for c in sorted(parsed.constants):
         tokenizer.encode_symbol(c)
-    for v in parsed.variables:
+    for v in sorted(parsed.variables):
         tokenizer.encode_symbol(v)
     graphs, _ = build_all_proof_graphs(parsed, theorems)
     plan = pack_levels(graphs, parsed, tokenizer)
@@ -87,68 +85,6 @@ class TestCudaKernelAvailability:
         assert hasattr(mod, "push_nodes_launch")
         assert hasattr(mod, "execute_assertion_launch")
         assert hasattr(mod, "final_check_launch")
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  CUDA vs Torch path equivalence (internal consistency)
-# ══════════════════════════════════════════════════════════════════════
-
-
-class TestCudaVsTorch:
-
-    def test_demo0_equivalence(self) -> None:
-        """CUDA and torch paths must produce identical results on demo0.mm."""
-        parsed = _load_mm("demo0.mm")
-        plan, _ = _build_plan(parsed)
-        device = torch.device("cuda")
-
-        torch_result, _, _ = _run_gpu_pipeline(
-            plan, torch.device("cpu"), plan.max_expr_len, verbose=False
-        )
-        cuda_result, _, _ = _run_gpu_pipeline_cuda(
-            plan, device, plan.max_expr_len, verbose=False
-        )
-
-        np.testing.assert_array_equal(
-            cuda_result, torch_result,
-            err_msg="CUDA and torch paths diverge on demo0.mm"
-        )
-
-    def test_ql_equivalence(self) -> None:
-        """CUDA and torch paths must produce identical results on ql.mm."""
-        parsed = _load_mm("ql.mm")
-        plan, _ = _build_plan(parsed)
-        device = torch.device("cuda")
-
-        torch_result, _, _ = _run_gpu_pipeline(
-            plan, torch.device("cpu"), plan.max_expr_len, verbose=False
-        )
-        cuda_result, _, _ = _run_gpu_pipeline_cuda(
-            plan, device, plan.max_expr_len, verbose=False
-        )
-
-        np.testing.assert_array_equal(
-            cuda_result, torch_result,
-            err_msg="CUDA and torch paths diverge on ql.mm"
-        )
-
-    def test_anatomy_equivalence(self) -> None:
-        """CUDA and torch paths must produce identical results on anatomy.mm."""
-        parsed = _load_mm("anatomy.mm")
-        plan, _ = _build_plan(parsed)
-        device = torch.device("cuda")
-
-        torch_result, _, _ = _run_gpu_pipeline(
-            plan, torch.device("cpu"), plan.max_expr_len, verbose=False
-        )
-        cuda_result, _, _ = _run_gpu_pipeline_cuda(
-            plan, device, plan.max_expr_len, verbose=False
-        )
-
-        np.testing.assert_array_equal(
-            cuda_result, torch_result,
-            err_msg="CUDA and torch paths diverge on anatomy.mm"
-        )
 
 
 # ══════════════════════════════════════════════════════════════════════
