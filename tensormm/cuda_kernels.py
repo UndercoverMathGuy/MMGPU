@@ -36,6 +36,16 @@ _CUDA_SOURCE = r"""
 static constexpr long long HASH_BASE = 1000000007LL;
 using tok_t = unsigned short;  // uint16 token type — halves expr_buffer memory
 
+// ─── Failure reason codes (stored in node_fail_code, int8_t) ─────────
+// 0: no failure
+// 1: propagated — an input node already failed
+// 2: ehyp mismatch — essential hypothesis substitution did not match
+// 3: conclusion overflow — substituted conclusion exceeded allocated capacity
+static constexpr int8_t FAIL_NONE        = 0;
+static constexpr int8_t FAIL_INPUT       = 1;
+static constexpr int8_t FAIL_EHYP        = 2;
+static constexpr int8_t FAIL_OVERFLOW    = 3;
+
 // ─── Helper: stream-substitute a pattern and compare against a target ─
 // Returns true if the substituted pattern matches the target exactly.
 // Never materializes the substituted output — compares token-by-token.
@@ -245,7 +255,7 @@ __global__ void execute_assertion_kernel(
     tok_t* __restrict__ expr_buffer,                  // [total_expr_tokens] packed
     int* __restrict__ expr_lengths_buf,             // [total_nodes]
     long long* __restrict__ expr_hashes,            // [total_nodes]
-    bool* __restrict__ node_failed,                 // [total_nodes]
+    int8_t* __restrict__ node_fail_code,            // [total_nodes] — FAIL_* constants
     const long long* __restrict__ expr_offsets      // [total_nodes+1]
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -261,7 +271,7 @@ __global__ void execute_assertion_kernel(
     bool any_failed = false;
     for (int k = 0; k < n_inputs; k++) {
         int in_gi = input_global_indices[(long long)b * max_inputs + k];
-        if (in_gi >= 0 && node_failed[in_gi]) {
+        if (in_gi >= 0 && node_fail_code[in_gi] != FAIL_NONE) {
             any_failed = true;
             break;
         }
@@ -345,7 +355,13 @@ __global__ void execute_assertion_kernel(
 
     expr_lengths_buf[out_gi] = out_len;
     expr_hashes[out_gi] = out_hash;
-    node_failed[out_gi] = !ehyps_ok || any_failed;
+
+    // Write the most specific failure code (overflow > ehyp > input > none)
+    int8_t fail_code = FAIL_NONE;
+    if (any_failed) fail_code = FAIL_INPUT;
+    if (!ehyps_ok)  fail_code = FAIL_EHYP;
+    if (out_len > out_capacity) fail_code = FAIL_OVERFLOW;
+    node_fail_code[out_gi] = fail_code;
 }
 
 
@@ -367,7 +383,7 @@ __global__ void final_check_kernel(
     const tok_t* __restrict__ expr_buffer,              // [total_expr_tokens] packed
     const int* __restrict__ expr_lengths_buf,         // [total_nodes]
     const long long* __restrict__ expr_hashes,        // [total_nodes]
-    const bool* __restrict__ node_failed,             // [total_nodes]
+    const int8_t* __restrict__ node_fail_code,        // [total_nodes] — FAIL_* constants
     const long long* __restrict__ expr_offsets,        // [total_nodes+1]
     // Output
     bool* __restrict__ proof_passed                   // [num_proofs]
@@ -378,13 +394,13 @@ __global__ void final_check_kernel(
     int final_gi = final_node_indices[tid];
     int final_len = expr_lengths_buf[final_gi];
     long long final_hash = expr_hashes[final_gi];
-    bool failed = node_failed[final_gi];
+    int8_t fail_code = node_fail_code[final_gi];
 
     int expected_len = conclusion_lengths[tid];
     long long expected_hash = expected_hashes[tid];
 
-    // Length must match
-    if (final_len != expected_len || failed) {
+    // Any kernel-level failure or length mismatch → proof fails
+    if (fail_code != FAIL_NONE || final_len != expected_len) {
         proof_passed[tid] = false;
         return;
     }
@@ -458,7 +474,7 @@ void execute_assertion_launch(
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
-    torch::Tensor node_failed,
+    torch::Tensor node_fail_code,
     torch::Tensor expr_offsets
 ) {
     if (B == 0) return;
@@ -484,7 +500,7 @@ void execute_assertion_launch(
         reinterpret_cast<tok_t*>(expr_buffer.data_ptr<int16_t>()),
         expr_lengths_buf.data_ptr<int>(),
         reinterpret_cast<long long*>(expr_hashes.data_ptr<int64_t>()),
-        node_failed.data_ptr<bool>(),
+        node_fail_code.data_ptr<int8_t>(),
         reinterpret_cast<const long long*>(expr_offsets.data_ptr<int64_t>())
     );
 }
@@ -499,7 +515,7 @@ void final_check_launch(
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
-    torch::Tensor node_failed,
+    torch::Tensor node_fail_code,
     torch::Tensor expr_offsets,
     torch::Tensor proof_passed
 ) {
@@ -516,7 +532,7 @@ void final_check_launch(
         reinterpret_cast<const tok_t*>(expr_buffer.data_ptr<int16_t>()),
         expr_lengths_buf.data_ptr<int>(),
         reinterpret_cast<const long long*>(expr_hashes.data_ptr<int64_t>()),
-        node_failed.data_ptr<bool>(),
+        node_fail_code.data_ptr<int8_t>(),
         reinterpret_cast<const long long*>(expr_offsets.data_ptr<int64_t>()),
         proof_passed.data_ptr<bool>()
     );
@@ -558,7 +574,7 @@ void execute_assertion_launch(
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
-    torch::Tensor node_failed,
+    torch::Tensor node_fail_code,
     torch::Tensor expr_offsets
 );
 
@@ -572,7 +588,7 @@ void final_check_launch(
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
-    torch::Tensor node_failed,
+    torch::Tensor node_fail_code,
     torch::Tensor expr_offsets,
     torch::Tensor proof_passed
 );
@@ -599,7 +615,7 @@ def _try_compile():
     try:
         from torch.utils.cpp_extension import load_inline
         _compiled_module = load_inline(
-            name="mmgpu_cuda_kernels_v5",
+            name="mmgpu_cuda_kernels_v6",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -695,7 +711,7 @@ def cuda_execute_level(
     expr_buffer: torch.Tensor,
     expr_lengths: torch.Tensor,
     expr_hashes: torch.Tensor,
-    node_failed: torch.Tensor,
+    node_fail_code: torch.Tensor,   # int8 — FAIL_* codes
     expr_offsets: torch.Tensor,
     device: torch.device,
 ) -> None:
@@ -754,7 +770,7 @@ def cuda_execute_level(
             tbl_fhyp_var_ids, tbl_fhyp_count,
             tbl_ehyp_patterns, tbl_ehyp_pattern_lengths, tbl_ehyp_count,
             P_max, tbl_max_fhyps, tbl_max_ehyps, E_max,
-            expr_buffer, expr_lengths, expr_hashes, node_failed,
+            expr_buffer, expr_lengths, expr_hashes, node_fail_code,
             expr_offsets,
         )
         # Sync between sublevels to ensure writes are visible
@@ -769,7 +785,7 @@ def cuda_final_check(
     expr_buffer: torch.Tensor,
     expr_lengths: torch.Tensor,
     expr_hashes: torch.Tensor,
-    node_failed: torch.Tensor,
+    node_fail_code: torch.Tensor,           # int8 — FAIL_* codes
     expr_offsets: torch.Tensor,
     device: torch.device,
 ) -> np.ndarray:
@@ -796,7 +812,7 @@ def cuda_final_check(
         num_proofs,
         fi_t, ec_t, cl_t, eh_t,
         max_concl_stored,
-        expr_buffer, expr_lengths, expr_hashes, node_failed,
+        expr_buffer, expr_lengths, expr_hashes, node_fail_code,
         expr_offsets,
         proof_passed,
     )

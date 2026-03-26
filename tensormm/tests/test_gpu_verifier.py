@@ -228,7 +228,7 @@ class TestFullPipeline:
 
         parsed = _load_mm("demo0.mm")
         results = verify_database(parsed, device=torch.device("cpu"), verbose=True)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} GPU failures on demo0.mm"
 
     def test_ql_full(self) -> None:
@@ -240,7 +240,7 @@ class TestFullPipeline:
 
         parsed = _load_mm("ql.mm")
         results = verify_database(parsed, device=torch.device("cpu"), verbose=True)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} GPU failures on ql.mm"
 
     def test_ehyp_masking_no_false_failures(self) -> None:
@@ -252,7 +252,7 @@ class TestFullPipeline:
         """
         parsed = _load_mm("ql.mm")
         results = verify_database(parsed, device=torch.device("cpu"), check_dv=False)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, (
             f"{n_fail} false GPU failures on ql.mm (ehyp masking broken?)"
         )
@@ -279,7 +279,7 @@ class TestGPUDevice:
 
         parsed = _load_mm("demo0.mm")
         results = verify_database(parsed, verbose=True)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0
 
     @pytest.mark.skipif(not (CUDA_AVAILABLE or MPS_AVAILABLE), reason="No GPU")
@@ -292,5 +292,5 @@ class TestGPUDevice:
 
         parsed = _load_mm("ql.mm")
         results = verify_database(parsed, verbose=True)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} divergences on ql.mm"

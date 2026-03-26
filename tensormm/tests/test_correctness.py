@@ -39,7 +39,7 @@ def _gpu_all_pass(mm_path: str) -> bool:
     if not theorems:
         return True
     results = verify_database(parsed, theorem_labels=theorems, verbose=False)
-    return all(results.values())
+    return all(v is None for v in results.values())
 
 
 # ══════════════════════════════════════════════════════════════════════

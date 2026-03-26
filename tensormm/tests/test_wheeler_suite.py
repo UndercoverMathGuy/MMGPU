@@ -61,7 +61,7 @@ def _verify_gpu(parsed: ParsedDatabase) -> tuple[int, int, str]:
     if not theorems:
         return 0, 0, "no theorems"
     results = verify_database(parsed, theorem_labels=theorems)
-    n_fail = sum(1 for v in results.values() if not v)
+    n_fail = sum(1 for v in results.values() if v is not None)
     n_pass = len(results) - n_fail
     return len(results), n_fail, f"{n_pass}/{len(results)} theorems pass"
 

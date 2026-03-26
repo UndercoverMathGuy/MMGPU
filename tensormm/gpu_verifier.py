@@ -238,11 +238,11 @@ def _init_graph_worker(parsed: ParsedDatabase) -> None:
     _GRAPH_WORKER_LABEL_INFO = _build_label_info(parsed)
 
 
-def _build_graphs_chunk(labels: list[str]) -> list[ProofGraph | str]:
+def _build_graphs_chunk(labels: list[str]) -> list[tuple[str, ProofGraph | str]]:
     parsed = _GRAPH_WORKER_PARSED
     label_info = _GRAPH_WORKER_LABEL_INFO
     assert parsed is not None and label_info is not None
-    return [build_proof_graph(parsed, lbl, label_info) for lbl in labels]
+    return [(lbl, build_proof_graph(parsed, lbl, label_info)) for lbl in labels]
 
 
 def build_all_proof_graphs(
@@ -250,8 +250,12 @@ def build_all_proof_graphs(
     theorem_labels: list[str],
     max_workers: int | None = None,
     verbose: bool = False,
-) -> tuple[list[ProofGraph], list[str]]:
-    """Build proof graphs for all theorems in parallel."""
+) -> tuple[list[ProofGraph], list[tuple[str, str]]]:
+    """Build proof graphs for all theorems in parallel.
+
+    Returns:
+        (graphs, errors) where errors is a list of (label, reason) pairs.
+    """
     if not theorem_labels:
         return [], []
 
@@ -293,8 +297,8 @@ def build_all_proof_graphs(
         )
 
     graphs: list[ProofGraph] = []
-    errors: list[str] = []
-    ordered: list[list[ProofGraph | str]] = [None] * len(chunks)  # type: ignore
+    errors: list[tuple[str, str]] = []  # (label, reason)
+    ordered: list[list[tuple[str, ProofGraph | str]]] = [None] * len(chunks)  # type: ignore
     done = 0
 
     with pool as executor:
@@ -311,9 +315,9 @@ def build_all_proof_graphs(
                 print(f"  Graph construction: {done:,}/{len(theorem_labels):,} ({pct:.0f}%)", flush=True)
 
     for chunk_results in ordered:
-        for result in chunk_results:
+        for lbl, result in chunk_results:
             if isinstance(result, str):
-                errors.append(result)
+                errors.append((lbl, result))
             else:
                 graphs.append(result)
 
@@ -1406,7 +1410,8 @@ def _run_gpu_pipeline_cuda(
     expr_buffer  = torch.empty(max(total_tokens, 1), dtype=torch.int16, device=device)
     expr_lengths = torch.zeros(total_nodes, dtype=torch.int32, device=device)
     expr_hashes  = torch.zeros(total_nodes, dtype=torch.int64, device=device)
-    node_failed  = torch.zeros(total_nodes, dtype=torch.bool,  device=device)
+    # int8 failure codes: 0=ok, 1=input_propagated, 2=ehyp_mismatch, 3=conclusion_overflow
+    node_fail_code = torch.zeros(total_nodes, dtype=torch.int8, device=device)
     expr_offsets = torch.from_numpy(offsets_np).to(device)
 
     if verbose:
@@ -1480,7 +1485,7 @@ def _run_gpu_pipeline_cuda(
             tbl_pattern_toks_t, tbl_pattern_lengths_t,
             tbl_fhyp_var_ids_t, tbl_fhyp_count_t,
             tbl_ehyp_patterns_t, tbl_ehyp_pattern_lengths_t, tbl_ehyp_count_t,
-            expr_buffer, expr_lengths, expr_hashes, node_failed,
+            expr_buffer, expr_lengths, expr_hashes, node_fail_code,
             expr_offsets,
             device,
         )
@@ -1504,12 +1509,16 @@ def _run_gpu_pipeline_cuda(
         plan.expected_conclusions,
         plan.conclusion_lengths,
         plan.expected_conclusion_hashes,
-        expr_buffer, expr_lengths, expr_hashes, node_failed,
+        expr_buffer, expr_lengths, expr_hashes, node_fail_code,
         expr_offsets,
         device,
     )
 
-    return proof_passed_np, had_intermediate_truncation, max_intermediate
+    # Read per-proof fail codes from the final nodes before freeing GPU memory
+    final_idx_t = torch.from_numpy(plan.final_node_indices.astype(np.int64)).to(device)
+    per_proof_fail_codes = node_fail_code[final_idx_t].cpu().numpy()  # [num_proofs] int8
+
+    return proof_passed_np, had_intermediate_truncation, max_intermediate, per_proof_fail_codes
 
 
 def _run_gpu_pipeline(
@@ -1517,7 +1526,7 @@ def _run_gpu_pipeline(
     device: torch.device,
     max_expr_len: int,
     verbose: bool = False,
-) -> tuple[np.ndarray, bool, int]:
+) -> tuple[np.ndarray, bool, int, np.ndarray]:
     """Single run of the GPU pipeline with a given max_expr_len.
 
     Dispatches to custom CUDA kernels when available (zero intermediate
@@ -1531,7 +1540,9 @@ def _run_gpu_pipeline(
     hash (expr_hashes), so no retry is needed for those.
 
     Returns:
-        (per_proof_passed, had_intermediate_truncation, max_intermediate_len)
+        (per_proof_passed, had_intermediate_truncation, max_intermediate_len,
+         per_proof_fail_codes)  — fail codes are int8 FAIL_* values; all zeros
+         on the PyTorch fallback path (no per-kernel error codes available).
     """
     # ── Dispatch to CUDA kernel path if available ─────────────────
     if device.type == "cuda" and _cuda_mod.is_available():
@@ -1682,7 +1693,9 @@ def _run_gpu_pipeline(
     content_match = torch.where(fits_in_buffer, token_match, hash_match)
 
     proof_passed = length_match & content_match & ~final_node_fail
-    return proof_passed.cpu().numpy(), had_intermediate_truncation, max_intermediate
+    # PyTorch path has no per-kernel fail codes — return zeros (no info)
+    no_codes = np.zeros(plan.num_proofs, dtype=np.int8)
+    return proof_passed.cpu().numpy(), had_intermediate_truncation, max_intermediate, no_codes
 
 # ── CUDA warmup ────────────────────────────────────────────────────────
 _CUDA_WARMED_UP: set[str] = set()
@@ -1920,7 +1933,7 @@ def verify_proofs_gpu(
     plan: GlobalPlan,
     device: torch.device,
     verbose: bool = False,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float, np.ndarray]:
     """Execute the full GPU verification pipeline.
 
     Retries with a larger expr_buffer only when INTERMEDIATE nodes are
@@ -1930,13 +1943,14 @@ def verify_proofs_gpu(
     quartfull's 11548-token conclusion without a 278 GB allocation.
 
     Returns:
-        (per_proof_passed: np.ndarray[bool], gpu_time: float)
+        (per_proof_passed: np.ndarray[bool], gpu_time: float,
+         per_proof_fail_codes: np.ndarray[int8])
     """
     t0 = time.perf_counter()
     max_expr_len = plan.max_expr_len
 
     while max_expr_len <= _MAX_EXPR_LEN_CAP:
-        result, had_truncation, needed = _run_gpu_pipeline(
+        result, had_truncation, needed, fail_codes = _run_gpu_pipeline(
             plan, device, max_expr_len, verbose=verbose,
         )
         if not had_truncation:
@@ -1952,7 +1966,7 @@ def verify_proofs_gpu(
         max_expr_len = new_len
 
     gpu_time = time.perf_counter() - t0
-    return result, gpu_time
+    return result, gpu_time, fail_codes
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1977,12 +1991,14 @@ def _apply_subst(expr: list[str], subst: dict[str, list[str]]) -> list[str]:
     return out
 
 
-def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
+def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> str | None:
     """Replay a proof and check all $d constraints.
 
     Walks the proof stack exactly like a standard Metamath verifier but only
     checks disjoint variable conditions — the GPU has already validated the
-    substitution arithmetic.  Returns True if all $d constraints are satisfied.
+    substitution arithmetic.
+
+    Returns None if all $d constraints are satisfied, or a reason string on failure.
 
     The Metamath $d rule: when applying an assertion with $d x y, for every
     variable v in subst(x) and every variable w in subst(y), the pair (v, w)
@@ -2006,22 +2022,23 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
 
     stack: list[list[str]] = []
 
-    def _step(lbl: str) -> bool:
+    def _step(lbl: str) -> str | None:
+        """Returns None on success, or an error reason string on failure."""
         info = _info(lbl)
         if info is None:
-            return False
+            return f"unknown label {lbl!r}"
         kind, data = info
         if kind == "$f":
             stack.append([data.type_code, data.variable])
-            return True
+            return None
         if kind == "$e":
             stack.append(list(data.expression))
-            return True
+            return None
         # Assertion step: pop hyps, build substitution, check $d, push conclusion
         a = data
         n_pop = len(a.floating_hyps) + len(a.essential_hyps)
         if len(stack) < n_pop:
-            return False
+            return f"stack underflow applying {lbl}: need {n_pop}, have {len(stack)}"
         sp = len(stack) - n_pop
         subst: dict[str, list[str]] = {}
         for flbl in a.floating_hyps:
@@ -2037,11 +2054,20 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
             sy = _vars_in_expr(subst.get(y, [y]), variables)
             for v in sx:
                 for w in sy:
-                    if v == w or (min(v, w), max(v, w)) not in active_dv:
-                        return False
+                    if v == w:
+                        return (
+                            f"$d violation in {lbl}: ${x} and ${y} both map to "
+                            f"variable {v!r} (must be distinct)"
+                        )
+                    pair = (min(v, w), max(v, w))
+                    if pair not in active_dv:
+                        return (
+                            f"$d violation in {lbl}: ${x}→{v!r} and ${y}→{w!r} "
+                            f"are not disjoint in {theorem_label}"
+                        )
         del stack[len(stack) - n_pop:]
         stack.append(_apply_subst(a.expression, subst))
-        return True
+        return None
 
     try:
         if assertion.compressed_proof is not None:
@@ -2051,27 +2077,28 @@ def _check_dv_one(parsed: ParsedDatabase, theorem_label: str) -> bool:
             for pi in cp.proof_ints:
                 if pi == -1:
                     if not stack:
-                        return False
+                        return "Z-save on empty stack"
                     saved.append(list(stack[-1]))
                 elif pi < label_end:
-                    if not _step(cp.labels[pi]):
-                        return False
+                    err = _step(cp.labels[pi])
+                    if err:
+                        return err
                 else:
                     si = pi - label_end
                     if si >= len(saved):
-                        return False
+                        return f"backref {si} out of range ({len(saved)} saved)"
                     stack.append(list(saved[si]))
         elif assertion.proof is not None:
             for lbl in assertion.proof:
-                if not _step(lbl):
-                    return False
+                err = _step(lbl)
+                if err:
+                    return err
         else:
-            return True  # axiom — no proof to check
+            return None  # axiom — no proof to check
     except Exception as e:
-        print(f"  [DV] EXCEPTION in {theorem_label}: {e}", flush=True)
-        return False
+        return f"exception: {e}"
 
-    return True
+    return None
 
 
 
@@ -2083,7 +2110,8 @@ def _init_dv_worker(parsed: ParsedDatabase) -> None:
     _DV_WORKER_PARSED = parsed
 
 
-def _check_dv_chunk(labels: list[str]) -> dict[str, bool]:
+def _check_dv_chunk(labels: list[str]) -> dict[str, str | None]:
+    """Returns {label: reason} where reason is None on success."""
     assert _DV_WORKER_PARSED is not None
     return {lbl: _check_dv_one(_DV_WORKER_PARSED, lbl) for lbl in labels}
 
@@ -2092,21 +2120,24 @@ def _check_dv_constraints(
     parsed: ParsedDatabase,
     graphs: list[ProofGraph],
     proof_passed: np.ndarray,
-) -> np.ndarray:
+    verbose: bool = False,
+) -> tuple[np.ndarray, dict[str, str]]:
     """Check $d constraints for proofs that passed GPU verification.
 
     Replays each proof on CPU (cheap — just stack walking to extract
     substitutions and check disjoint variable pairs, no GPU involvement).
     Uses spawn context so workers never inherit the parent's CUDA state.
 
-    Returns updated proof_passed array.
+    Returns:
+        (updated proof_passed array, {label: reason} for each $d failure)
     """
     result = proof_passed.copy()
+    dv_failures: dict[str, str] = {}
     labels_to_check = [
         g.theorem_label for pi, g in enumerate(graphs) if result[pi]
     ]
     if not labels_to_check:
-        return result
+        return result, dv_failures
 
     workers = min(os.cpu_count() or 1, 32)
     chunk_size = max(1, len(labels_to_check) // (workers * 4))
@@ -2124,18 +2155,58 @@ def _check_dv_constraints(
         initargs=(parsed,),
     )
 
-    dv_results: dict[str, bool] = {}
+    dv_results: dict[str, str | None] = {}
     with pool as executor:
         futures = {executor.submit(_check_dv_chunk, chunk): chunk for chunk in chunks}
         for future in as_completed(futures):
             dv_results.update(future.result())
 
     label_to_pi = {g.theorem_label: pi for pi, g in enumerate(graphs)}
-    for lbl, passed in dv_results.items():
-        if not passed:
+    for lbl, reason in dv_results.items():
+        if reason is not None:
             result[label_to_pi[lbl]] = False
+            dv_failures[lbl] = reason
+            if verbose:
+                print(f"    $d failure [{lbl}]: {reason}", flush=True)
 
-    return result
+    return result, dv_failures
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Failure-reason helpers
+# ══════════════════════════════════════════════════════════════════════
+
+# Maps int8 node_fail_code values (from CUDA kernel) to human-readable strings.
+_FAIL_CODE_NAMES: dict[int, str] = {
+    0: "ok",
+    1: "input_failed",    # propagated from a failed dependency
+    2: "ehyp_mismatch",  # essential hypothesis substitution did not match
+    3: "conclusion_overflow",  # substituted conclusion exceeded allocated capacity
+}
+
+
+def fail_code_name(code: int) -> str:
+    """Return a human-readable name for a CUDA node_fail_code value."""
+    return _FAIL_CODE_NAMES.get(code, f"unknown({code})")
+
+
+def get_fail_reasons(
+    node_fail_code: torch.Tensor,   # [total_nodes] int8 on device
+    final_node_indices: np.ndarray, # [num_proofs] int32
+    proof_labels: list[str],
+) -> dict[str, str]:
+    """Return {label: reason} for every proof whose final node has a non-zero fail code.
+
+    Useful for post-hoc diagnostics after GPU verification.  Only reads
+    final-node codes — intermediate failures are summarised by propagation.
+    """
+    codes = node_fail_code[torch.from_numpy(final_node_indices).long().to(node_fail_code.device)]
+    codes_np = codes.cpu().numpy()
+    return {
+        label: fail_code_name(int(codes_np[i]))
+        for i, label in enumerate(proof_labels)
+        if codes_np[i] != 0
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2156,7 +2227,7 @@ def _verify_proofs_gpu_batched(
     plan: GlobalPlan,
     device: torch.device,
     verbose: bool = False,
-) -> tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float, np.ndarray]:
     """Run GPU verification in sequential batches sized to fit available VRAM.
 
     Instead of loading all proof nodes into VRAM at once, splits the plan into
@@ -2266,6 +2337,7 @@ def _verify_proofs_gpu_batched(
         print(f"  Phase 3: {N} proofs → {num_batches} sequential batch(es)", flush=True)
 
     all_results: list[np.ndarray] = []
+    all_fail_codes: list[np.ndarray] = []
     remaining = plan
     for batch_idx in range(num_batches):
         if batch_idx < num_batches - 1:
@@ -2281,16 +2353,18 @@ def _verify_proofs_gpu_batched(
                 flush=True,
             )
 
-        result, _ = verify_proofs_gpu(shard, device, verbose=verbose)
+        result, _, fail_codes = verify_proofs_gpu(shard, device, verbose=verbose)
         all_results.append(result)
+        all_fail_codes.append(fail_codes)
 
         # Explicitly free GPU memory before next batch
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     proof_passed = np.concatenate(all_results)
+    per_proof_fail_codes = np.concatenate(all_fail_codes)
     t_gpu = time.perf_counter() - t0
-    return proof_passed, t_gpu
+    return proof_passed, t_gpu, per_proof_fail_codes
 
 
 def verify_database(
@@ -2299,7 +2373,7 @@ def verify_database(
     device: torch.device | None = None,
     verbose: bool = False,
     check_dv: bool = True,
-) -> dict[str, bool]:
+) -> dict[str, str | None]:
     """Verify theorems using true GPU-accelerated verification.
 
     Phase 1: Build dependency graphs (CPU, O(n), parallel)
@@ -2315,7 +2389,15 @@ def verify_database(
         check_dv: Whether to check $d constraints (default True)
 
     Returns:
-        {label: passed} for each theorem
+        {label: failure_reason} for each theorem.
+        None means the proof passed.
+        A string is the failure reason — one of:
+          "graph:<msg>"        — proof graph construction failed (stack error etc.)
+          "ehyp_mismatch"      — essential hypothesis check failed (CUDA kernel)
+          "input_failed"       — a dependency node failed (propagated)
+          "conclusion_overflow"— conclusion exceeded buffer capacity (bug in pre-pass)
+          "dv:<msg>"           — $d disjoint variable constraint violated
+          "result_mismatch"    — final expression did not match expected conclusion
     """
     if device is None:
         device = _select_device()
@@ -2340,21 +2422,20 @@ def verify_database(
             f"  Phase 1 (graph construction): {t_graph:.2f}s — "
             f"{len(graphs)} graphs, {len(graph_errors)} errors"
         )
+        for lbl, reason in graph_errors:
+            print(f"    graph error [{lbl}]: {reason}", flush=True)
 
     # Build result dict — graph errors are immediate failures
-    results: dict[str, bool] = {}
-    error_labels: set[str] = set()
-    for err in graph_errors:
-        # Error string format varies, but we need the label
-        # Graph errors contain the theorem label
-        results[err] = False  # We'll fix this below
-        error_labels.add(err)
+    # None = passed, string = failure reason
+    results: dict[str, str | None] = {}
+    for lbl, reason in graph_errors:
+        results[lbl] = f"graph:{reason}"
 
-    # For graph errors, mark the theorem as failed
+    # Any theorem with no graph (not in graph_errors either) also fails
     graph_theorem_labels = {g.theorem_label for g in graphs}
     for lbl in theorem_labels:
-        if lbl not in graph_theorem_labels:
-            results[lbl] = False
+        if lbl not in graph_theorem_labels and lbl not in results:
+            results[lbl] = "graph:unknown"
 
     if not graphs:
         return results
@@ -2378,7 +2459,7 @@ def verify_database(
         )
 
     # ── Phase 3: GPU execution ───────────────────────────────────
-    proof_passed, t_gpu = _verify_proofs_gpu_batched(plan, device, verbose=verbose)
+    proof_passed, t_gpu, per_proof_fail_codes = _verify_proofs_gpu_batched(plan, device, verbose=verbose)
     if verbose:
         n_pass = int(proof_passed.sum())
         print(
@@ -2387,9 +2468,10 @@ def verify_database(
         )
 
     # ── Phase 4: $d post-check ───────────────────────────────────
+    dv_failures: dict[str, str] = {}
     if check_dv:
         t2 = time.perf_counter()
-        proof_passed = _check_dv_constraints(parsed, graphs, proof_passed)
+        proof_passed, dv_failures = _check_dv_constraints(parsed, graphs, proof_passed, verbose=verbose)
         t_dv = time.perf_counter() - t2
         if verbose:
             n_pass = int(proof_passed.sum())
@@ -2398,8 +2480,18 @@ def verify_database(
                 f"{n_pass}/{len(graphs)} proofs passed"
             )
 
-    # ── Build final results ──────────────────────────────────────
+    # ── Build final results with failure reasons ─────────────────
     for pi, g in enumerate(graphs):
-        results[g.theorem_label] = bool(proof_passed[pi])
+        lbl = g.theorem_label
+        if proof_passed[pi]:
+            results[lbl] = None
+        elif lbl in dv_failures:
+            results[lbl] = f"dv:{dv_failures[lbl]}"
+        else:
+            code = int(per_proof_fail_codes[pi])
+            if code != 0:
+                results[lbl] = fail_code_name(code)
+            else:
+                results[lbl] = "result_mismatch"
 
     return results

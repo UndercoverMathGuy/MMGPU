@@ -102,7 +102,7 @@ class TestCudaFullPipeline:
 
         parsed = _load_mm("demo0.mm")
         results = verify_database(parsed, device=torch.device("cuda"), verbose=False)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} CUDA failures on demo0.mm"
 
     def test_anatomy_vs_knife(self) -> None:
@@ -114,7 +114,7 @@ class TestCudaFullPipeline:
 
         parsed = _load_mm("anatomy.mm")
         results = verify_database(parsed, device=torch.device("cuda"), verbose=False)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} CUDA failures on anatomy.mm"
 
     def test_ql_vs_knife(self) -> None:
@@ -124,7 +124,7 @@ class TestCudaFullPipeline:
 
         parsed = _load_mm("ql.mm")
         results = verify_database(parsed, device=torch.device("cuda"), verbose=False)
-        n_fail = sum(1 for v in results.values() if not v)
+        n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} CUDA failures on ql.mm"
 
 
