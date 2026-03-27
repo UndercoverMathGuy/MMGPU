@@ -267,13 +267,16 @@ __global__ void execute_assertion_kernel(
     int n_inputs = input_counts[b];
     int out_gi = output_global_indices[b];
 
-    // ── (a) Check if any input failed ────────────────────────────────
-    bool any_failed = false;
+    // ── (a) Propagate worst input failure code ────────────────────────
+    // Carry the root cause code (max severity) from all inputs instead of
+    // collapsing to FAIL_INPUT. This preserves FAIL_EHYP/FAIL_OVERFLOW across
+    // nodes that have no ehyps of their own (e.g. ax-maj wrapping a failed ax-mp).
+    int8_t input_fail_code = FAIL_NONE;
     for (int k = 0; k < n_inputs; k++) {
         int in_gi = input_global_indices[(long long)b * max_inputs + k];
-        if (in_gi >= 0 && node_fail_code[in_gi] != FAIL_NONE) {
-            any_failed = true;
-            break;
+        if (in_gi >= 0) {
+            int8_t c = node_fail_code[in_gi];
+            if (c > input_fail_code) input_fail_code = c;
         }
     }
 
@@ -356,10 +359,10 @@ __global__ void execute_assertion_kernel(
     expr_lengths_buf[out_gi] = out_len;
     expr_hashes[out_gi] = out_hash;
 
-    // Write the most specific failure code (overflow > ehyp > input > none)
-    int8_t fail_code = FAIL_NONE;
-    if (any_failed) fail_code = FAIL_INPUT;
-    if (!ehyps_ok)  fail_code = FAIL_EHYP;
+    // Write failure code: local failures take priority, then propagated root cause.
+    // Priority: overflow > ehyp_mismatch > propagated-from-input > none.
+    int8_t fail_code = input_fail_code;  // root cause from upstream (may be FAIL_NONE)
+    if (!ehyps_ok)           fail_code = FAIL_EHYP;
     if (out_len > out_capacity) fail_code = FAIL_OVERFLOW;
     node_fail_code[out_gi] = fail_code;
 }
