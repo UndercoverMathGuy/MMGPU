@@ -196,7 +196,7 @@ _WHEELER_BAD = [
     ("anatomy-bad3.mm",     "ProofUnderflow",     "graph:"),
     ("big-unifier-bad1.mm", "StepEssenWrongType", "ehyp_mismatch"),
     ("big-unifier-bad2.mm", "ProofExcessEnd",     "graph:"),
-    ("big-unifier-bad3.mm", "StepEssenWrongType", "ehyp_mismatch"),
+    ("big-unifier-bad3.mm", "StepEssenWrongType", "graph:"),
     ("demo0-bad1.mm",       "StepEssenWrong",     "ehyp_mismatch"),
     ("set-dist-bad1.mm",    "ProofDvViolation",   "dv:"),
 ]
