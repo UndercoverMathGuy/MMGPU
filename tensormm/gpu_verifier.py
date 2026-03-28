@@ -925,7 +925,7 @@ def _nb_pack_assertion_level(
             out_ehyp_input_positions[b, e] = nf + e
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _nb_compute_expr_lengths_batch(
     output_global: np.ndarray,     # [B] int32
     assertion_idxs: np.ndarray,    # [B] int32
@@ -938,14 +938,15 @@ def _nb_compute_expr_lengths_batch(
 ) -> None:
     """Compute expression lengths for one level's assertion nodes.
 
-    Called once per level (~300 calls total).  The f-loop runs in compiled
-    Numba, eliminating the ~48k numpy temporary allocations that the old
-    vectorised approach required.
+    Called once per level (~300 calls total).  Nodes within a level are
+    independent (inputs come from earlier levels), so prange is safe.
+    The f-loop runs in compiled Numba, eliminating the ~48k numpy temporary
+    allocations that the old vectorised approach required.
     """
     B = len(output_global)
     max_in = input_global.shape[1]
     max_f  = tbl_var_occ.shape[1]
-    for b in range(B):
+    for b in prange(B):
         a_idx = assertion_idxs[b]
         nf = tbl_fhyp_count[a_idx]
         out_len = tbl_const_count[a_idx]
@@ -3144,7 +3145,7 @@ def _check_dv_constraints(
 
     else:
         # ── Slow fallback: spawn-based process pool ─────────────────────
-        workers = min(os.cpu_count() or 1, 32)
+        workers = os.cpu_count() or 1
         chunk_size = max(1, len(labels_to_check) // (workers * 4))
         chunks = [
             labels_to_check[i: i + chunk_size]
