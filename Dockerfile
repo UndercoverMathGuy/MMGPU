@@ -68,7 +68,6 @@ RUN wget -q -O data/demo0.mm    $MM_TEST/demo0.mm \
 
 # Copy project source
 COPY pyproject.toml .
-COPY conftest.py .
 COPY tensormm/ tensormm/
 COPY run_setmm.py .
 COPY run_all.py .
