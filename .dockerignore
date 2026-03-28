@@ -4,7 +4,12 @@ __pycache__/
 .pytest_cache/
 .git/
 .windsurf/
+.claude/
+.ruff_cache/
 *.egg-info/
 data/set.mm
 data/ql.mm
 *.txt
+
+# Rust build artifacts (rebuilt inside container)
+rust_ext/target/

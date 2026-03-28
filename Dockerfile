@@ -30,11 +30,19 @@ RUN cargo install --git https://github.com/metamath/metamath-knife --locked
 
 WORKDIR /app
 
-# Install PyTorch with CUDA 12.6 support + deps
+# Install PyTorch with CUDA 12.6 support + deps (includes maturin for Rust ext)
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
     torch --index-url https://download.pytorch.org/whl/cu126 \
     && python3 -m pip install --break-system-packages --no-cache-dir \
-    numpy pytest ninja
+    numpy pytest ninja maturin numba
+
+# Build and install the Rust extension (mmgpu_rs) with maturin
+# Copied early so Rust builds are cached unless rust_ext/ changes
+COPY rust_ext/ rust_ext/
+RUN cd rust_ext && maturin build --release --interpreter python3 \
+    && python3 -m pip install --break-system-packages --no-cache-dir \
+    target/wheels/mmgpu_rs-*.whl \
+    && rm -rf target
 
 # Download set.mm from Metamath GitHub
 RUN mkdir -p data \
@@ -60,6 +68,7 @@ RUN wget -q -O data/demo0.mm    $MM_TEST/demo0.mm \
 
 # Copy project source
 COPY pyproject.toml .
+COPY conftest.py .
 COPY tensormm/ tensormm/
 COPY run_setmm.py .
 COPY run_all.py .

@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import subprocess
 import shutil
+import time
 
 import pytest
 import torch
@@ -14,6 +15,7 @@ import torch
 from tensormm.gpu_verifier import (
     build_proof_graph,
     build_all_proof_graphs,
+    build_all_proof_graphs_rs,
     pack_levels,
     verify_database,
     _build_label_info,
@@ -63,7 +65,7 @@ class TestGraphConstruction:
             result = build_proof_graph(parsed, lbl, label_info)
             assert not isinstance(result, str), f"Graph build failed for {lbl}: {result}"
             assert result.theorem_label == lbl
-            assert len(result.nodes) > 0
+            assert result.num_nodes > 0
             assert result.max_level >= 0
 
     def test_ql_all_graphs_build(self) -> None:
@@ -89,15 +91,18 @@ class TestGraphConstruction:
         g = build_proof_graph(parsed, theorems[0], label_info)
         assert not isinstance(g, str), f"Failed: {g}"
 
-        for node in g.nodes:
-            if node.node_type in ("push_f", "push_e"):
-                assert node.level == 0
-                assert node.expression is not None
-                assert len(node.input_steps) == 0
-            elif node.node_type == "assertion":
-                assert node.level >= 0
-                if node.input_steps:
-                    assert node.level >= 1
+        from tensormm.gpu_verifier import NODE_PUSH_F, NODE_PUSH_E, NODE_ASSERTION
+        for i in range(g.num_nodes):
+            nt = g.node_types[i]
+            if nt == NODE_PUSH_F or nt == NODE_PUSH_E:
+                assert g.node_levels[i] == 0
+                # push nodes have no inputs in CSR
+                assert g.input_offsets[i] == g.input_offsets[i + 1]
+            elif nt == NODE_ASSERTION:
+                assert g.node_levels[i] >= 0
+                n_inputs = g.input_offsets[i + 1] - g.input_offsets[i]
+                if n_inputs > 0:
+                    assert g.node_levels[i] >= 1
 
     def test_compressed_proof_z_backref(self) -> None:
         """ql.mm uses compressed proofs — Z backrefs must work."""
@@ -142,13 +147,19 @@ class TestGraphConstruction:
             g = build_proof_graph(parsed, lbl, label_info)
             if isinstance(g, str):
                 continue
-            node_levels = {n.step_idx: n.level for n in g.nodes}
-            for node in g.nodes:
-                if node.node_type == "assertion":
-                    for inp in node.input_steps:
-                        assert node_levels[inp] < node.level, (
-                            f"Level violation in {lbl}: node {node.step_idx} at level "
-                            f"{node.level} depends on node {inp} at level {node_levels[inp]}"
+            from tensormm.gpu_verifier import NODE_ASSERTION
+            # node_levels[i] == g.node_levels[i] (step_idx == array index)
+            for i in range(g.num_nodes):
+                if g.node_types[i] == NODE_ASSERTION:
+                    lvl = int(g.node_levels[i])
+                    inp_start = int(g.input_offsets[i])
+                    inp_end   = int(g.input_offsets[i + 1])
+                    for k in range(inp_start, inp_end):
+                        dep_step = int(g.input_data[k])
+                        dep_lvl  = int(g.node_levels[dep_step])
+                        assert dep_lvl < lvl, (
+                            f"Level violation in {lbl}: node {i} at level "
+                            f"{lvl} depends on node {dep_step} at level {dep_lvl}"
                         )
 
 
@@ -294,3 +305,77 @@ class TestGPUDevice:
         results = verify_database(parsed, verbose=True)
         n_fail = sum(1 for v in results.values() if v is not None)
         assert n_fail == 0, f"{n_fail} divergences on ql.mm"
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  set.mm CPU preprocessing benchmark
+# ══════════════════════════════════════════════════════════════════════
+
+
+class TestSetMMBenchmark:
+    """Timed CPU preprocessing benchmark on the full set.mm database.
+
+    Skipped when set.mm is absent.  Prints phase-by-phase wall times and
+    asserts basic sanity (node count, zero pack errors) but does NOT run
+    GPU execution — this is purely a preprocessing throughput test.
+    """
+
+    @pytest.mark.skipif(
+        not os.path.exists(os.path.join(DATA_DIR, "set.mm")),
+        reason="set.mm not found in data/",
+    )
+    def test_setmm_preprocessing_timing(self, capsys) -> None:
+        """Parse → graph construction → level packing on full set.mm, with timing."""
+        set_mm_path = os.path.join(DATA_DIR, "set.mm")
+
+        # ── Parse ──────────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        parsed = parse_mm_file(set_mm_path)
+        t_parse = time.perf_counter() - t0
+
+        tokenizer = Tokenizer()
+        for c in parsed.constants:
+            tokenizer.encode_symbol(c)
+        for v in parsed.variables:
+            tokenizer.encode_symbol(v)
+
+        theorems = [lbl for lbl, a in parsed.assertions.items() if a.type == "theorem"]
+        n_theorems = len(theorems)
+
+        # ── Phase 1a: Rust graph construction (with tokenizer for pre-encoding)
+        t0 = time.perf_counter()
+        graphs_rs, errors_rs = build_all_proof_graphs_rs(
+            parsed, theorems, tokenizer=tokenizer, verbose=True
+        )
+        t_phase1_rs = time.perf_counter() - t0
+
+        # ── Phase 1b: Python graph construction (for comparison) ───────
+        t0 = time.perf_counter()
+        graphs, errors = build_all_proof_graphs(parsed, theorems, verbose=False)
+        t_phase1_py = time.perf_counter() - t0
+
+        # Use Rust graphs for Phase 2
+        t0 = time.perf_counter()
+        plan = pack_levels(graphs_rs, parsed, tokenizer, verbose=True)
+        t_phase2 = time.perf_counter() - t0
+
+        t_total_rs = t_parse + t_phase1_rs + t_phase2
+
+        with capsys.disabled():
+            print(f"\n{'═'*60}")
+            print(f"  set.mm preprocessing benchmark")
+            print(f"{'─'*60}")
+            print(f"  theorems       : {n_theorems:>10,}")
+            print(f"  total nodes    : {plan.total_nodes:>10,}")
+            print(f"  graph errors   : {len(errors_rs):>10,}")
+            print(f"{'─'*60}")
+            print(f"  parse          : {t_parse:>8.2f}s")
+            print(f"  phase 1 Rust   : {t_phase1_rs:>7.2f}s  ({n_theorems/t_phase1_rs:,.0f} theorems/s)")
+            print(f"  phase 1 Python : {t_phase1_py:>7.2f}s  ({n_theorems/t_phase1_py:,.0f} theorems/s)")
+            print(f"  phase 2 (pack) : {t_phase2:>8.2f}s  ({plan.total_nodes/t_phase2:,.0f} nodes/s)")
+            print(f"  total (Rust p1): {t_total_rs:>8.2f}s")
+            print(f"{'═'*60}")
+
+        assert plan.total_nodes > 1_000_000, f"Expected >1M nodes for set.mm, got {plan.total_nodes}"
+        assert len(errors_rs) == 0, f"{len(errors_rs)} Rust graph build errors on set.mm"
+        assert plan.num_proofs == len(graphs_rs)

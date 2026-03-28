@@ -5,6 +5,8 @@ description = "GPU-Accelerated Metamath Proof Verification via PyTorch Tensor Op
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "maturin>=1.12.6",
+    "numba>=0.61.0",
     "numpy>=2.2.6",
     "pytest>=9.0.2",
     "torch>=2.10.0",

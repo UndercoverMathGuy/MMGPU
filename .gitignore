@@ -10,3 +10,11 @@ wheels/
 # Virtual environments
 .venv
 .claude
+
+# Rust build artifacts
+rust_ext/target/
+
+# Compiled native extensions (maturin develop output)
+*.so
+*.dylib
+*.pyd

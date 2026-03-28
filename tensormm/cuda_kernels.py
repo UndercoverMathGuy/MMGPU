@@ -540,12 +540,90 @@ void final_check_launch(
         proof_passed.data_ptr<bool>()
     );
 }
+
+// --- Kernel 4: compute_assertion_table_stats ----------------------------
+// One thread per assertion. Scans the pattern token row and for each
+// token within the valid length either:
+//   matches one of the n_fhyps variable IDs -> increments var_occ[i, f]
+//   matches nothing                         -> increments const_count[i]
+//
+// Replaces the CPU numpy broadcast [A, P, F] which allocates a ~1.3 GB
+// intermediate bool tensor for set.mm (42k x 796 x 40). This kernel uses
+// O(1) registers per thread and no intermediate allocation.
+__global__ void compute_assertion_table_stats_kernel(
+    const tok_t* __restrict__ pattern_toks,    // [A, P_max] row-major
+    const int*   __restrict__ pattern_lengths, // [A]
+    const tok_t* __restrict__ fhyp_var_ids,    // [A, F_max] row-major
+    const int*   __restrict__ fhyp_count,      // [A]
+    int A, int P_max, int F_max,
+    int* __restrict__ const_count,             // [A] output
+    int* __restrict__ var_occ                  // [A, F_max] output
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= A) return;
+
+    int pl = pattern_lengths[i];
+    int nf = fhyp_count[i];
+    int cc = 0;
+
+    const tok_t* pat_row = pattern_toks + (long long)i * P_max;
+    const tok_t* var_row = fhyp_var_ids + (long long)i * F_max;
+    int*         occ_row = var_occ      + (long long)i * F_max;
+
+    for (int p = 0; p < pl; p++) {
+        tok_t tok = pat_row[p];
+        bool matched = false;
+        for (int f = 0; f < nf; f++) {
+            if (tok == var_row[f]) {
+                occ_row[f]++;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) cc++;
+    }
+    const_count[i] = cc;
+}
+
+void compute_assertion_table_stats_launch(
+    torch::Tensor pattern_toks,    // [A, P_max] int16
+    torch::Tensor pattern_lengths, // [A] int32
+    torch::Tensor fhyp_var_ids,    // [A, F_max] int16
+    torch::Tensor fhyp_count,      // [A] int32
+    torch::Tensor const_count,     // [A] int32 -- output, pre-zeroed
+    torch::Tensor var_occ          // [A, F_max] int32 -- output, pre-zeroed
+) {
+    int A     = pattern_toks.size(0);
+    int P_max = pattern_toks.size(1);
+    int F_max = fhyp_var_ids.size(1);
+    if (A == 0) return;
+    int threads = 256;
+    int blocks  = (A + threads - 1) / threads;
+    compute_assertion_table_stats_kernel<<<blocks, threads>>>(
+        reinterpret_cast<const tok_t*>(pattern_toks.data_ptr<int16_t>()),
+        pattern_lengths.data_ptr<int>(),
+        reinterpret_cast<const tok_t*>(fhyp_var_ids.data_ptr<int16_t>()),
+        fhyp_count.data_ptr<int>(),
+        A, P_max, F_max,
+        const_count.data_ptr<int>(),
+        var_occ.data_ptr<int>()
+    );
+}
 """
 
 _CPP_SOURCE = r"""
 #include <torch/extension.h>
 
 // Forward declarations — implementations are in the .cu file
+void compute_assertion_table_stats_launch(
+    torch::Tensor pattern_toks,
+    torch::Tensor pattern_lengths,
+    torch::Tensor fhyp_var_ids,
+    torch::Tensor fhyp_count,
+    torch::Tensor const_count,
+    torch::Tensor var_occ
+);
+
 void push_nodes_launch(
     torch::Tensor push_global_indices,
     torch::Tensor push_expressions,
@@ -618,10 +696,11 @@ def _try_compile():
     try:
         from torch.utils.cpp_extension import load_inline
         _compiled_module = load_inline(
-            name="mmgpu_cuda_kernels_v6",
+            name="mmgpu_cuda_kernels_v7",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
+                "compute_assertion_table_stats_launch",
                 "push_nodes_launch",
                 "execute_assertion_launch",
                 "final_check_launch",
@@ -649,6 +728,39 @@ def get_module():
 # ══════════════════════════════════════════════════════════════════════
 #  Python API — thin wrappers that handle numpy→torch conversion
 # ══════════════════════════════════════════════════════════════════════
+
+
+def cuda_compute_assertion_table_stats(
+    pattern_toks: np.ndarray,    # [A, P_max] int16
+    pattern_lengths: np.ndarray, # [A] int32
+    fhyp_var_ids: np.ndarray,    # [A, F_max] int16
+    fhyp_count: np.ndarray,      # [A] int32
+    device: torch.device,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute const_count [A] and var_occ [A, F_max] on CUDA.
+
+    Returns numpy arrays.  Falls back to the numpy broadcast path if CUDA
+    kernels are unavailable (no GPU, or compilation failed).
+    """
+    mod = _try_compile()
+    if mod is None:
+        return None, None  # caller handles fallback
+
+    A     = pattern_toks.shape[0]
+    F_max = fhyp_var_ids.shape[1]
+
+    dev = device
+    pt  = torch.from_numpy(pattern_toks).to(dev)
+    pl  = torch.from_numpy(pattern_lengths).to(dev)
+    vi  = torch.from_numpy(fhyp_var_ids).to(dev)
+    fc  = torch.from_numpy(fhyp_count).to(dev)
+    cc  = torch.zeros(A,        dtype=torch.int32, device=dev)
+    vo  = torch.zeros((A, F_max), dtype=torch.int32, device=dev)
+
+    mod.compute_assertion_table_stats_launch(pt, pl, vi, fc, cc, vo)
+    torch.cuda.synchronize(dev)
+
+    return cc.cpu().numpy(), vo.cpu().numpy()
 
 
 def cuda_push_nodes(

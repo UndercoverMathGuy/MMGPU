@@ -13,7 +13,7 @@ import time
 
 import torch
 from tensormm.parser import parse_mm_file
-from tensormm.gpu_verifier import verify_database, warmup_cuda
+from tensormm.gpu_verifier import verify_database, warmup_cuda, warmup_numba
 
 if __name__ == '__main__':
     # ── Fail loudly if no GPU ──────────────────────────────────────────
@@ -43,6 +43,11 @@ if __name__ == '__main__':
         warmup_cuda(device)
         torch.cuda.synchronize()
         print(f"CUDA kernel warmup: {time.perf_counter() - _t_warm:.2f}s")
+
+    # Numba JIT warmup — pre-compile Phase 2 kernels (LLVM compilation)
+    _t_warm = time.perf_counter()
+    warmup_numba()
+    print(f"Numba kernel warmup: {time.perf_counter() - _t_warm:.2f}s")
     print()
 
     # ── Locate set.mm ──────────────────────────────────────────────────
