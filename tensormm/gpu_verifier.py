@@ -926,6 +926,49 @@ def _nb_pack_assertion_level(
 
 
 @njit(parallel=True, cache=True)
+def _nb_compute_expr_lengths_batch(
+    output_global: np.ndarray,     # [B] int32 — output slot for each node
+    assertion_idxs: np.ndarray,    # [B] int32 — row in AssertionTable
+    input_global: np.ndarray,      # [B, max_inputs] int32 — global input indices (-1=invalid)
+    fhyp_positions: np.ndarray,    # [B, max_fhyps] int32 — which input slot each $f maps to
+    n_fhyps: np.ndarray,           # [B] int32
+    tbl_const_count: np.ndarray,   # [A] int32 — constant token count per assertion pattern
+    tbl_var_occ: np.ndarray,       # [A, max_f] int32 — variable occurrences per fhyp slot
+    node_expr_lengths: np.ndarray, # [total_nodes] int32 — read prev levels, write this level
+) -> None:
+    """Compute output expression lengths for one sublevel's assertion nodes.
+
+    Each thread handles one node: reads input lengths from node_expr_lengths
+    (previous-level slots, no write hazard), sums const_count + var_occ*sub_len
+    for each $f hyp, then writes to its own output slot.  Races are impossible:
+    inputs live in earlier levels, outputs are distinct per node.
+    """
+    B = len(output_global)
+    max_in = input_global.shape[1]
+    max_f  = tbl_var_occ.shape[1]
+    for b in prange(B):
+        a_idx = assertion_idxs[b]
+        nf    = n_fhyps[b]
+        out_len = tbl_const_count[a_idx]
+        for f in range(nf):
+            if f >= max_f:
+                break
+            fhyp_pos = fhyp_positions[b, f]
+            if fhyp_pos < 0:
+                fhyp_pos = 0
+            if fhyp_pos >= max_in:
+                fhyp_pos = max_in - 1
+            input_gi = input_global[b, fhyp_pos]
+            if input_gi >= 0:
+                input_len = node_expr_lengths[input_gi]
+                sub_len = input_len - 1
+                if sub_len < 0:
+                    sub_len = 0
+                out_len += tbl_var_occ[a_idx, f] * sub_len
+        node_expr_lengths[output_global[b]] = out_len
+
+
+@njit(parallel=True, cache=True)
 def _nb_gather_csr(
     positions: np.ndarray,          # [B] int32 — global node indices for this level
     global_inp_offsets: np.ndarray, # [total_nodes+1] int32
@@ -1479,7 +1522,10 @@ def pack_levels(
     # Push nodes: length is known directly
     node_expr_lengths[push_global_indices] = push_expr_lengths
 
-    # Assertion nodes: level by level (respecting sublevel ordering)
+    # Assertion nodes: level by level via Numba prange kernel.
+    # Each call processes one sublevel's B nodes fully in parallel — no Python
+    # f-loop, no intermediate numpy allocations.  The kernel reads input lengths
+    # from previous-level slots and writes to distinct output slots (no races).
     for batch in assertion_batches:
         if batch.sublevel_ranges is not None:
             ranges = batch.sublevel_ranges
@@ -1498,34 +1544,16 @@ def pack_levels(
             if B_sl == 0:
                 continue
             s = slice(sl_start, sl_end)
-            a_idxs = batch.assertion_idx[s]  # [B_sl]
-
-            out_lens = _tbl_const_count[a_idxs].copy()  # [B_sl]
-            n_fhyps_per = tbl.fhyp_count[a_idxs]  # [B_sl]
-            max_f_sl = int(n_fhyps_per.max()) if B_sl > 0 else 0
-            b_range = np.arange(B_sl)
-
-            for f in range(max_f_sl):
-                fhyp_valid = f < n_fhyps_per  # [B_sl] bool
-                if not fhyp_valid.any():
-                    continue
-                if f < batch.fhyp_input_positions.shape[1]:
-                    fhyp_pos = batch.fhyp_input_positions[s, f]  # [B_sl]
-                else:
-                    fhyp_pos = np.zeros(B_sl, dtype=np.int32)
-                max_in = batch.input_global_indices.shape[1]
-                fhyp_pos = np.clip(fhyp_pos, 0, max_in - 1)
-                input_gi = batch.input_global_indices[sl_start + b_range, fhyp_pos]
-                valid_in = input_gi >= 0
-                input_gi_safe = np.where(valid_in, input_gi, 0)
-                input_lens = node_expr_lengths[input_gi_safe]
-                input_lens = np.where(valid_in, input_lens, 0)
-                sub_lens = np.maximum(input_lens - 1, 0)  # skip type code
-                var_occ = _tbl_var_occ[a_idxs, f]  # [B_sl]
-                out_lens += np.where(fhyp_valid, var_occ * sub_lens, 0)
-
-            out_gis = batch.output_global_indices[s]
-            node_expr_lengths[out_gis] = out_lens
+            _nb_compute_expr_lengths_batch(
+                batch.output_global_indices[s],
+                batch.assertion_idx[s],
+                batch.input_global_indices[sl_start:sl_end],
+                batch.fhyp_input_positions[sl_start:sl_end],
+                tbl.fhyp_count[batch.assertion_idx[s]],
+                _tbl_const_count,
+                _tbl_var_occ,
+                node_expr_lengths,
+            )
 
     total_expr_tokens = int(node_expr_lengths.sum())
     del _tbl_const_count, _tbl_var_occ
@@ -2571,6 +2599,19 @@ def warmup_numba() -> None:
         out_aidx, out_ig, out_ic, out_fp, out_ep, out_og,
     )
 
+    dummy_out_g   = np.zeros(1, dtype=np.int32)
+    dummy_aidxs   = np.zeros(1, dtype=np.int32)
+    dummy_in_g    = np.zeros((1, 1), dtype=np.int32)
+    dummy_fhyp_p  = np.zeros((1, 1), dtype=np.int32)
+    dummy_nf      = np.zeros(1, dtype=np.int32)
+    dummy_cc      = np.zeros(1, dtype=np.int32)
+    dummy_vo      = np.zeros((1, 1), dtype=np.int32)
+    dummy_nel     = np.zeros(1, dtype=np.int32)
+    _nb_compute_expr_lengths_batch(
+        dummy_out_g, dummy_aidxs, dummy_in_g, dummy_fhyp_p,
+        dummy_nf, dummy_cc, dummy_vo, dummy_nel,
+    )
+
     _NUMBA_WARMED_UP = True
 
 
@@ -2764,9 +2805,163 @@ def verify_proofs_gpu(
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Phase 4 — $d Post-Check (CPU)
+#  Phase 4 — $d Post-Check
 # ══════════════════════════════════════════════════════════════════════
 
+
+def _serialize_dv_for_rust(
+    parsed: ParsedDatabase,
+    theorem_labels: list[str],
+) -> tuple:
+    """Serialise ParsedDatabase into flat byte arrays for check_dv_all.
+
+    Builds a fresh sym_to_id / label_to_lid in one pass (same stable ordering
+    as _serialize_db_for_rust so label IDs are consistent) then adds the
+    DV-specific fields that check_dv_all needs.
+    """
+    sym_to_id: dict[str, int] = {}
+
+    def sid(s: str) -> int:
+        v = sym_to_id.get(s)
+        if v is None:
+            v = len(sym_to_id)
+            sym_to_id[s] = v
+        return v
+
+    # ── Label table ───────────────────────────────────────────────────
+    all_labels: list[str] = []
+    label_to_lid: dict[str, int] = {}
+    for lbl in parsed.floating_hyps:
+        label_to_lid[lbl] = len(all_labels); all_labels.append(lbl)
+    for lbl in parsed.essential_hyps:
+        label_to_lid[lbl] = len(all_labels); all_labels.append(lbl)
+    for lbl in parsed.assertions:
+        label_to_lid[lbl] = len(all_labels); all_labels.append(lbl)
+
+    L = len(all_labels)
+    lt_arr     = bytearray(L)
+    lf_tc_arr  = np.full(L, -1, dtype=np.int32)
+    lf_var_arr = np.full(L, -1, dtype=np.int32)
+
+    le_len_arr = np.zeros(L, dtype=np.int32)
+    le_data: list[int] = []
+
+    la_ne_arr = np.zeros(L, dtype=np.int32)
+
+    # DV-specific arrays
+    la_fhyp_var_len = np.zeros(L, dtype=np.int32)
+    la_fhyp_var_data: list[int] = []
+    la_expr_len = np.zeros(L, dtype=np.int32)
+    la_expr_data: list[int] = []
+    la_dv_len = np.zeros(L, dtype=np.int32)   # in i32 elements (pairs × 2)
+    la_dv_data: list[int] = []
+
+    for lbl, lid in label_to_lid.items():
+        if lbl in parsed.floating_hyps:
+            fh = parsed.floating_hyps[lbl]
+            lt_arr[lid] = 0
+            lf_tc_arr[lid]  = sid(fh.type_code)
+            lf_var_arr[lid] = sid(fh.variable)
+        elif lbl in parsed.essential_hyps:
+            eh = parsed.essential_hyps[lbl]
+            lt_arr[lid] = 1
+            enc = [sid(s) for s in eh.expression]
+            le_data.extend(enc)
+            le_len_arr[lid] = len(enc)
+        else:
+            a = parsed.assertions[lbl]
+            lt_arr[lid] = 2
+            la_ne_arr[lid] = len(a.essential_hyps)
+            # fhyp vars in order
+            fv = [sid(parsed.floating_hyps[flbl].variable) for flbl in a.floating_hyps]
+            la_fhyp_var_data.extend(fv)
+            la_fhyp_var_len[lid] = len(fv)
+            # conclusion expression
+            expr_enc = [sid(s) for s in a.expression]
+            la_expr_data.extend(expr_enc)
+            la_expr_len[lid] = len(expr_enc)
+            # mandatory DV pairs (interleaved x y, already canonical min/max from parser)
+            for x, y in a.disjoint_vars:
+                la_dv_data.extend([sid(x), sid(y)])
+            la_dv_len[lid] = len(a.disjoint_vars) * 2
+
+    # Build CSR offset arrays from length arrays
+    def _make_csr(lengths: np.ndarray) -> np.ndarray:
+        off = np.empty(L + 1, dtype=np.int32)
+        off[0] = 0
+        np.cumsum(lengths, out=off[1:])
+        return off
+
+    le_off_arr          = _make_csr(le_len_arr)
+    la_fhyp_var_off_arr = _make_csr(la_fhyp_var_len)
+    la_expr_off_arr     = _make_csr(la_expr_len)
+    la_dv_off_arr       = _make_csr(la_dv_len)
+
+    # ── Theorem proofs ────────────────────────────────────────────────
+    T = len(theorem_labels)
+    thm_proof_offsets  = np.zeros(T + 1, dtype=np.int64)
+    thm_plabel_offsets = np.zeros(T + 1, dtype=np.int32)
+    thm_proof_data: list[int] = []
+    thm_plabel_data: list[int] = []
+
+    # Active DV per theorem (canonical pairs interleaved min max)
+    thm_active_dv_offsets = np.zeros(T + 1, dtype=np.int32)
+    thm_active_dv_data: list[int] = []
+
+    for ti, thm_lbl in enumerate(theorem_labels):
+        a = parsed.assertions[thm_lbl]
+        if a.compressed_proof is not None:
+            cp = a.compressed_proof
+            plabels_lids = [label_to_lid[lbl] for lbl in cp.labels]
+            thm_plabel_data.extend(plabels_lids)
+            thm_plabel_offsets[ti + 1] = thm_plabel_offsets[ti] + len(plabels_lids)
+            thm_proof_data.extend(cp.proof_ints)
+            thm_proof_offsets[ti + 1] = thm_proof_offsets[ti] + len(cp.proof_ints)
+        elif a.proof is not None:
+            for step_lbl in a.proof:
+                thm_plabel_data.append(label_to_lid[step_lbl])
+                thm_proof_data.append(len(thm_plabel_data) - 1 - int(thm_plabel_offsets[ti]))
+            thm_plabel_offsets[ti + 1] = thm_plabel_offsets[ti] + len(a.proof)
+            thm_proof_offsets[ti + 1]  = thm_proof_offsets[ti]  + len(a.proof)
+        else:
+            thm_plabel_offsets[ti + 1] = thm_plabel_offsets[ti]
+            thm_proof_offsets[ti + 1]  = thm_proof_offsets[ti]
+
+        # active DV pairs for this theorem
+        pairs = a.all_disjoint_vars
+        for x, y in pairs:
+            thm_active_dv_data.extend([sid(x), sid(y)])
+        thm_active_dv_offsets[ti + 1] = thm_active_dv_offsets[ti] + len(pairs) * 2
+
+    # is_variable: bool per symbol (1 = variable, 0 = constant)
+    N_sym = len(sym_to_id)
+    is_variable_arr = bytearray(N_sym)
+    for sym, sym_id in sym_to_id.items():
+        if sym in parsed.variables:
+            is_variable_arr[sym_id] = 1
+
+    return (
+        T,
+        bytes(lt_arr),
+        lf_tc_arr.tobytes(),
+        lf_var_arr.tobytes(),
+        le_off_arr.tobytes(),
+        np.array(le_data, dtype=np.int32).tobytes(),
+        la_ne_arr.tobytes(),
+        la_fhyp_var_off_arr.tobytes(),
+        np.array(la_fhyp_var_data, dtype=np.int32).tobytes(),
+        la_expr_off_arr.tobytes(),
+        np.array(la_expr_data, dtype=np.int32).tobytes(),
+        la_dv_off_arr.tobytes(),
+        np.array(la_dv_data, dtype=np.int32).tobytes(),
+        thm_proof_offsets.tobytes(),
+        np.array(thm_proof_data, dtype=np.int32).tobytes(),
+        thm_plabel_offsets.tobytes(),
+        np.array(thm_plabel_data, dtype=np.int32).tobytes(),
+        thm_active_dv_offsets.tobytes(),
+        np.array(thm_active_dv_data, dtype=np.int32).tobytes(),
+        bytes(is_variable_arr),
+    )
 
 
 def _vars_in_expr(expr: list[str], variables: set[str]) -> set[str]:
@@ -2918,50 +3113,81 @@ def _check_dv_constraints(
 ) -> tuple[np.ndarray, dict[str, str]]:
     """Check $d constraints for proofs that passed GPU verification.
 
-    Replays each proof on CPU (cheap — just stack walking to extract
-    substitutions and check disjoint variable pairs, no GPU involvement).
-    Uses spawn context so workers never inherit the parent's CUDA state.
+    Uses the Rust extension (rayon parallel, same process, no spawn overhead)
+    when available.  Falls back to the spawn-based process pool otherwise.
 
     Returns:
-        (updated proof_passed array, {label: reason} for each $d failure)
+        (updated proof_passed array, {label: failure_reason} for each $d failure)
     """
     result = proof_passed.copy()
     dv_failures: dict[str, str] = {}
-    labels_to_check = [
-        g.theorem_label for pi, g in enumerate(graphs) if result[pi]
-    ]
+    passing_indices = [pi for pi, g in enumerate(graphs) if result[pi]]
+    labels_to_check = [graphs[pi].theorem_label for pi in passing_indices]
     if not labels_to_check:
         return result, dv_failures
 
-    workers = min(os.cpu_count() or 1, 32)
-    chunk_size = max(1, len(labels_to_check) // (workers * 4))
-    chunks = [
-        labels_to_check[i: i + chunk_size]
-        for i in range(0, len(labels_to_check), chunk_size)
-    ]
+    if _HAVE_RUST:
+        # ── Fast path: Rust/rayon, no subprocess overhead ──────────────
+        ser = _serialize_dv_for_rust(parsed, labels_to_check)
+        (T,
+         lt_b, lf_tc_b, lf_var_b, le_off_b, le_data_b,
+         la_ne_b,
+         la_fhyp_var_off_b, la_fhyp_var_data_b,
+         la_expr_off_b, la_expr_data_b,
+         la_dv_off_b, la_dv_data_b,
+         proof_off_b, proof_data_b, plabel_off_b, plabel_data_b,
+         active_dv_off_b, active_dv_data_b,
+         is_variable_b) = ser
 
-    # Always use spawn — fork inherits CUDA context and deadlocks.
-    ctx = multiprocessing.get_context("spawn")
-    pool = ProcessPoolExecutor(
-        max_workers=workers,
-        mp_context=ctx,
-        initializer=_init_dv_worker,
-        initargs=(parsed,),
-    )
+        raw_results: list = _mmgpu_rs.check_dv_all(
+            lt_b, lf_tc_b, lf_var_b, le_off_b, le_data_b,
+            la_ne_b,
+            la_fhyp_var_off_b, la_fhyp_var_data_b,
+            la_expr_off_b, la_expr_data_b,
+            la_dv_off_b, la_dv_data_b,
+            T,
+            proof_off_b, proof_data_b, plabel_off_b, plabel_data_b,
+            active_dv_off_b, active_dv_data_b,
+            is_variable_b,
+        )
 
-    dv_results: dict[str, str | None] = {}
-    with pool as executor:
-        futures = {executor.submit(_check_dv_chunk, chunk): chunk for chunk in chunks}
-        for future in as_completed(futures):
-            dv_results.update(future.result())
+        label_to_pi = {g.theorem_label: pi for pi, g in enumerate(graphs)}
+        for lbl, reason in zip(labels_to_check, raw_results):
+            if reason is not None:
+                pi = label_to_pi[lbl]
+                result[pi] = False
+                dv_failures[lbl] = f"dv:{reason}"
+                if verbose:
+                    print(f"    $d failure [{lbl}]: {reason}", flush=True)
 
-    label_to_pi = {g.theorem_label: pi for pi, g in enumerate(graphs)}
-    for lbl, reason in dv_results.items():
-        if reason is not None:
-            result[label_to_pi[lbl]] = False
-            dv_failures[lbl] = reason
-            if verbose:
-                print(f"    $d failure [{lbl}]: {reason}", flush=True)
+    else:
+        # ── Slow fallback: spawn-based process pool ─────────────────────
+        workers = min(os.cpu_count() or 1, 32)
+        chunk_size = max(1, len(labels_to_check) // (workers * 4))
+        chunks = [
+            labels_to_check[i: i + chunk_size]
+            for i in range(0, len(labels_to_check), chunk_size)
+        ]
+        ctx = multiprocessing.get_context("spawn")
+        pool = ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=ctx,
+            initializer=_init_dv_worker,
+            initargs=(parsed,),
+        )
+        dv_results: dict[str, str | None] = {}
+        with pool as executor:
+            futures = {executor.submit(_check_dv_chunk, chunk): chunk for chunk in chunks}
+            for future in as_completed(futures):
+                dv_results.update(future.result())
+
+        label_to_pi = {g.theorem_label: pi for pi, g in enumerate(graphs)}
+        for lbl, reason in dv_results.items():
+            if reason is not None:
+                result[label_to_pi[lbl]] = False
+                dv_failures[lbl] = reason
+                if verbose:
+                    print(f"    $d failure [{lbl}]: {reason}", flush=True)
 
     return result, dv_failures
 

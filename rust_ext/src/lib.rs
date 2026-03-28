@@ -388,8 +388,325 @@ fn bytes_of_i32(v: &[i32]) -> &[u8] {
     }
 }
 
+// ── $d post-check ─────────────────────────────────────────────────────────────
+
+/// Collect variable sym_ids that appear in a fully-substituted expression.
+/// `expr` is a sym_id slice (no type code).
+/// For each token: if it's a variable AND in subst, recurse into subst value;
+/// otherwise if it's a variable, emit it directly.
+fn vars_in_substituted(
+    expr: &[i32],
+    subst: &std::collections::HashMap<i32, Vec<i32>>,  // var_id → expr (no type code)
+    is_variable: &[u8],
+) -> Vec<i32> {
+    let mut out = Vec::new();
+    for &tok in expr {
+        let is_var = (tok as usize) < is_variable.len() && is_variable[tok as usize] != 0;
+        if is_var {
+            if let Some(s) = subst.get(&tok) {
+                // substituted — recurse into substitution value
+                for &v in s {
+                    let sv = (v as usize) < is_variable.len() && is_variable[v as usize] != 0;
+                    if sv {
+                        out.push(v);
+                    }
+                }
+            } else {
+                out.push(tok);
+            }
+        }
+    }
+    out
+}
+
+/// Apply substitution to an expression (with type code at position 0).
+/// Returns the new expression (with type code).
+fn apply_subst(
+    expr: &[i32],
+    subst: &std::collections::HashMap<i32, Vec<i32>>,
+) -> Vec<i32> {
+    let mut out = Vec::with_capacity(expr.len() * 2);
+    for (i, &tok) in expr.iter().enumerate() {
+        if i == 0 {
+            // type code — always literal
+            out.push(tok);
+        } else if let Some(s) = subst.get(&tok) {
+            out.extend_from_slice(s);
+        } else {
+            out.push(tok);
+        }
+    }
+    out
+}
+
+fn check_dv_one(
+    label_types: &[u8],
+    label_f_typecode: &[i32],
+    label_f_variable: &[i32],
+    label_e_expr_offsets: &[i32],
+    label_e_expr_data: &[i32],
+    label_a_ne: &[i32],
+    label_a_fhyp_var_offsets: &[i32],
+    label_a_fhyp_var_data: &[i32],
+    label_a_expr_offsets: &[i32],
+    label_a_expr_data: &[i32],
+    label_a_dv_offsets: &[i32],
+    label_a_dv_data: &[i32],  // interleaved: x0 y0 x1 y1 ...
+    proof_ints: &[i32],
+    plabels: &[i32],
+    active_dv: &std::collections::HashSet<(i32, i32)>,
+    is_variable: &[u8],
+) -> Option<String> {
+    let mut stack: Vec<Vec<i32>> = Vec::new();
+    let mut saved: Vec<Vec<i32>> = Vec::new();
+    let label_end = plabels.len();
+
+    for &pi in proof_ints {
+        if pi == -1 {
+            if stack.is_empty() {
+                return Some("Z-save on empty stack".to_string());
+            }
+            saved.push(stack.last().unwrap().clone());
+            continue;
+        }
+
+        let pi_u = pi as usize;
+        if pi_u >= label_end {
+            // backref
+            let si = pi_u - label_end;
+            if si >= saved.len() {
+                return Some(format!("backref {} out of range ({} saved)", si, saved.len()));
+            }
+            stack.push(saved[si].clone());
+            continue;
+        }
+
+        let global_lid = plabels[pi_u] as usize;
+        match label_types[global_lid] {
+            0 => {
+                // $f
+                stack.push(vec![label_f_typecode[global_lid], label_f_variable[global_lid]]);
+            }
+            1 => {
+                // $e
+                let es = label_e_expr_offsets[global_lid] as usize;
+                let ee = label_e_expr_offsets[global_lid + 1] as usize;
+                stack.push(label_e_expr_data[es..ee].to_vec());
+            }
+            2 => {
+                // $a or $p
+                let fv_start = label_a_fhyp_var_offsets[global_lid] as usize;
+                let fv_end   = label_a_fhyp_var_offsets[global_lid + 1] as usize;
+                let nf = fv_end - fv_start;
+                let ne = label_a_ne[global_lid] as usize;
+                let npop = nf + ne;
+
+                if stack.len() < npop {
+                    return Some(format!(
+                        "stack underflow: need {}, have {}", npop, stack.len()
+                    ));
+                }
+
+                let sp = stack.len() - npop;
+
+                // Build substitution: var_sym_id → expr without type code
+                let mut subst: std::collections::HashMap<i32, Vec<i32>> =
+                    std::collections::HashMap::with_capacity(nf);
+                for f in 0..nf {
+                    let var_id = label_a_fhyp_var_data[fv_start + f];
+                    let expr_with_tc = &stack[sp + f];
+                    // strip type code (index 0)
+                    let body = if expr_with_tc.len() > 1 {
+                        expr_with_tc[1..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    subst.insert(var_id, body);
+                }
+
+                // Check $d constraints
+                let dv_start = label_a_dv_offsets[global_lid] as usize;
+                let dv_end   = label_a_dv_offsets[global_lid + 1] as usize;
+                // dv_data is interleaved pairs: x0 y0 x1 y1 ...
+                let mut dv_i = dv_start;
+                while dv_i + 1 < dv_end {
+                    let x = label_a_dv_data[dv_i];
+                    let y = label_a_dv_data[dv_i + 1];
+                    dv_i += 2;
+
+                    // vars in subst(x) and subst(y)
+                    let x_expr: &[i32] = subst.get(&x).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let y_expr: &[i32] = subst.get(&y).map(|v| v.as_slice()).unwrap_or(&[]);
+
+                    let sx = if x_expr.is_empty() {
+                        // x is unsubstituted — treat as bare variable
+                        let is_var = (x as usize) < is_variable.len()
+                            && is_variable[x as usize] != 0;
+                        if is_var { vec![x] } else { vec![] }
+                    } else {
+                        vars_in_substituted(x_expr, &subst, is_variable)
+                    };
+
+                    let sy = if y_expr.is_empty() {
+                        let is_var = (y as usize) < is_variable.len()
+                            && is_variable[y as usize] != 0;
+                        if is_var { vec![y] } else { vec![] }
+                    } else {
+                        vars_in_substituted(y_expr, &subst, is_variable)
+                    };
+
+                    for &v in &sx {
+                        for &w in &sy {
+                            if v == w {
+                                return Some(format!(
+                                    "$d violation: variables ${} and ${} are the same",
+                                    x, y
+                                ));
+                            }
+                            let pair = (v.min(w), v.max(w));
+                            if !active_dv.contains(&pair) {
+                                return Some(format!(
+                                    "$d violation: sym {} and sym {} not disjoint",
+                                    v, w
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Apply subst to conclusion, push result
+                let ae_start = label_a_expr_offsets[global_lid] as usize;
+                let ae_end   = label_a_expr_offsets[global_lid + 1] as usize;
+                let conclusion = &label_a_expr_data[ae_start..ae_end];
+                let result = apply_subst(conclusion, &subst);
+
+                stack.truncate(sp);
+                stack.push(result);
+            }
+            _ => {
+                return Some(format!("unknown label type {} for lid {}", label_types[global_lid], global_lid));
+            }
+        }
+    }
+
+    None
+}
+
+/// Check $d constraints for all theorems in parallel (rayon).
+///
+/// Returns a Python list of one entry per theorem:
+///   - None  → passed
+///   - str   → failure reason
+#[pyfunction]
+fn check_dv_all<'py>(
+    py: Python<'py>,
+    // label table (same encoding as build_graphs)
+    label_types_b: &[u8],
+    label_f_typecode_b: &[u8],
+    label_f_variable_b: &[u8],
+    label_e_expr_offsets_b: &[u8],
+    label_e_expr_data_b: &[u8],
+    label_a_ne_b: &[u8],
+    // new: fhyp var sym_ids per assertion, CSR
+    label_a_fhyp_var_offsets_b: &[u8],
+    label_a_fhyp_var_data_b: &[u8],
+    // new: conclusion expr per assertion, CSR
+    label_a_expr_offsets_b: &[u8],
+    label_a_expr_data_b: &[u8],
+    // new: mandatory DV pairs per assertion, CSR (interleaved x y)
+    label_a_dv_offsets_b: &[u8],
+    label_a_dv_data_b: &[u8],
+    // theorems
+    num_theorems: usize,
+    thm_proof_offsets_b: &[u8],
+    thm_proof_data_b: &[u8],
+    thm_plabel_offsets_b: &[u8],
+    thm_plabel_data_b: &[u8],
+    // new: active DV pairs per theorem, CSR (canonical min/max pairs, interleaved)
+    thm_active_dv_offsets_b: &[u8],
+    thm_active_dv_data_b: &[u8],
+    // new: is_variable per symbol (u8, 0/1)
+    is_variable_b: &[u8],
+) -> PyResult<Bound<'py, PyList>> {
+    let label_types             = label_types_b;
+    let label_f_typecode        = bytemuck_cast_slice::<i32>(label_f_typecode_b);
+    let label_f_variable        = bytemuck_cast_slice::<i32>(label_f_variable_b);
+    let label_e_expr_offsets    = bytemuck_cast_slice::<i32>(label_e_expr_offsets_b);
+    let label_e_expr_data       = bytemuck_cast_slice::<i32>(label_e_expr_data_b);
+    let label_a_ne              = bytemuck_cast_slice::<i32>(label_a_ne_b);
+    let label_a_fhyp_var_off    = bytemuck_cast_slice::<i32>(label_a_fhyp_var_offsets_b);
+    let label_a_fhyp_var_data   = bytemuck_cast_slice::<i32>(label_a_fhyp_var_data_b);
+    let label_a_expr_off        = bytemuck_cast_slice::<i32>(label_a_expr_offsets_b);
+    let label_a_expr_data       = bytemuck_cast_slice::<i32>(label_a_expr_data_b);
+    let label_a_dv_off          = bytemuck_cast_slice::<i32>(label_a_dv_offsets_b);
+    let label_a_dv_data         = bytemuck_cast_slice::<i32>(label_a_dv_data_b);
+
+    let thm_proof_offsets       = bytemuck_cast_slice::<i64>(thm_proof_offsets_b);
+    let thm_proof_data          = bytemuck_cast_slice::<i32>(thm_proof_data_b);
+    let thm_plabel_offsets      = bytemuck_cast_slice::<i32>(thm_plabel_offsets_b);
+    let thm_plabel_data         = bytemuck_cast_slice::<i32>(thm_plabel_data_b);
+    let thm_active_dv_offsets   = bytemuck_cast_slice::<i32>(thm_active_dv_offsets_b);
+    let thm_active_dv_data      = bytemuck_cast_slice::<i32>(thm_active_dv_data_b);
+    let is_variable             = is_variable_b;
+
+    // Run all theorems in parallel
+    let results: Vec<Option<String>> = (0..num_theorems)
+        .into_par_iter()
+        .map(|ti| {
+            let ps = thm_proof_offsets[ti] as usize;
+            let pe = thm_proof_offsets[ti + 1] as usize;
+            let proof_ints = &thm_proof_data[ps..pe];
+
+            let pls = thm_plabel_offsets[ti] as usize;
+            let ple = thm_plabel_offsets[ti + 1] as usize;
+            let plabels = &thm_plabel_data[pls..ple];
+
+            // Build active_dv set for this theorem
+            let dv_s = thm_active_dv_offsets[ti] as usize;
+            let dv_e = thm_active_dv_offsets[ti + 1] as usize;
+            let dv_slice = &thm_active_dv_data[dv_s..dv_e];
+            let mut active_dv = std::collections::HashSet::with_capacity((dv_e - dv_s) / 2);
+            let mut i = 0;
+            while i + 1 < dv_slice.len() {
+                active_dv.insert((dv_slice[i], dv_slice[i + 1]));
+                i += 2;
+            }
+
+            check_dv_one(
+                label_types,
+                label_f_typecode,
+                label_f_variable,
+                label_e_expr_offsets,
+                label_e_expr_data,
+                label_a_ne,
+                label_a_fhyp_var_off,
+                label_a_fhyp_var_data,
+                label_a_expr_off,
+                label_a_expr_data,
+                label_a_dv_off,
+                label_a_dv_data,
+                proof_ints,
+                plabels,
+                &active_dv,
+                is_variable,
+            )
+        })
+        .collect();
+
+    // Pack into Python list
+    let out = PyList::empty(py);
+    for res in results {
+        match res {
+            None    => out.append(py.None())?,
+            Some(s) => out.append(s.into_pyobject(py)?)?,
+        }
+    }
+    Ok(out)
+}
+
 #[pymodule]
 fn mmgpu_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_graphs, m)?)?;
+    m.add_function(wrap_pyfunction!(check_dv_all, m)?)?;
     Ok(())
 }
