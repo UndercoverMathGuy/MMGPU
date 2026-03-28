@@ -925,6 +925,60 @@ def _nb_pack_assertion_level(
             out_ehyp_input_positions[b, e] = nf + e
 
 
+@njit(parallel=True, cache=True)
+def _nb_pack_all_assertions(
+    sorted_positions: np.ndarray,    # [N] int32 — global node indices, sorted by level
+    sorted_assert_idxs: np.ndarray,  # [N] int32 — assertion table index per node
+    sorted_nf: np.ndarray,           # [N] int32 — n_fhyps per node
+    sorted_ne: np.ndarray,           # [N] int32 — n_ehyps per node
+    all_input_offsets: np.ndarray,   # [total_nodes+1] int32 — global CSR offsets
+    all_input_data: np.ndarray,      # [total_inputs] int32 — global CSR data
+    max_inputs: int,
+    max_fhyps: int,
+    max_ehyps: int,
+    # outputs — pre-allocated to global-max dimensions
+    out_assertion_idx: np.ndarray,   # [N] int32
+    out_input_global: np.ndarray,    # [N, max_inputs] int32  (pre-filled -1)
+    out_input_counts: np.ndarray,    # [N] int32
+    out_fhyp_positions: np.ndarray,  # [N, max_fhyps] int32  (pre-zeroed)
+    out_ehyp_positions: np.ndarray,  # [N, max_ehyps] int32  (pre-zeroed)
+    out_output_global: np.ndarray,   # [N] int32
+) -> None:
+    """Pack ALL assertion nodes across ALL levels in one parallel call.
+
+    Each node independently reads its own inputs from the global CSR and
+    writes to its own output slot — no inter-node dependencies at packing
+    time, so prange over all N ≈ 3.6M nodes is safe.
+
+    Replaces 96 separate per-level calls each allocating large 2D arrays.
+    """
+    N = len(sorted_positions)
+    for b in prange(N):
+        pos = sorted_positions[b]
+        out_assertion_idx[b]  = sorted_assert_idxs[b]
+        out_output_global[b]  = pos
+
+        g_start  = all_input_offsets[pos]
+        g_end    = all_input_offsets[pos + 1]
+        n_inputs = g_end - g_start
+        out_input_counts[b] = n_inputs
+        for k in range(n_inputs):
+            if k >= max_inputs:
+                break
+            out_input_global[b, k] = all_input_data[g_start + k]
+
+        nf = sorted_nf[b]
+        ne = sorted_ne[b]
+        for f in range(nf):
+            if f >= max_fhyps:
+                break
+            out_fhyp_positions[b, f] = f
+        for e in range(ne):
+            if e >= max_ehyps:
+                break
+            out_ehyp_positions[b, e] = nf + e
+
+
 @njit(cache=True)
 def _nb_compute_expr_lengths_batch(
     output_global: np.ndarray,     # [B] int32
@@ -1347,16 +1401,17 @@ def pack_levels(
     level_ends   = np.cumsum(level_counts)
     level_starts = np.concatenate([[0], level_ends[:-1]])
 
-    # Build per-level views using the sorted global positions
-    _lvl_positions:      dict[int, np.ndarray] = {}
-    _lvl_assert_idxs_np: dict[int, np.ndarray] = {}
-    _lvl_nf_np:          dict[int, np.ndarray] = {}
-    _lvl_ne_np:          dict[int, np.ndarray] = {}
-    _lvl_graph_pis_np:   dict[int, np.ndarray] = {}
+    # Build flat sorted arrays for single-pass packing
+    sorted_assert_positions = sorted_assert_positions.astype(np.int32)
+    sorted_assert_idxs = all_assert_idxs[sorted_assert_positions]   # [N] assertion table idx
+    sorted_nf          = all_nf[sorted_assert_positions]             # [N] n_fhyps
+    sorted_ne          = all_ne[sorted_assert_positions]             # [N] n_ehyps
+    sorted_graph_pis   = all_graph_pis[sorted_assert_positions]      # [N] graph index
+
+    # String labels per level (metadata only — not on hot path)
     _lvl_labels:         dict[int, list] = {}
     _lvl_theorem_labels: dict[int, list] = {}
 
-    # Convert to numpy object arrays for O(1) fancy-indexed string lookup
     _used_labels_arr = np.empty(len(used_labels), dtype=object)
     for _i, _s in enumerate(used_labels):
         _used_labels_arr[_i] = _s
@@ -1366,22 +1421,15 @@ def pack_levels(
 
     for k, lvl in enumerate(sorted_levels):
         s, e = int(level_starts[k]), int(level_ends[k])
-        pos = sorted_assert_positions[s:e]
-        _lvl_positions[lvl]      = pos
-        _lvl_assert_idxs_np[lvl] = all_assert_idxs[pos]
-        _lvl_nf_np[lvl]          = all_nf[pos]
-        _lvl_ne_np[lvl]          = all_ne[pos]
-        _lvl_graph_pis_np[lvl]   = all_graph_pis[pos]
-        # String labels — use numpy fancy indexing instead of Python list comp
-        gidxs = _lvl_assert_idxs_np[lvl]
-        pis   = _lvl_graph_pis_np[lvl]
+        gidxs = sorted_assert_idxs[s:e]
+        pis   = sorted_graph_pis[s:e]
         _lvl_labels[lvl]         = _used_labels_arr[gidxs].tolist()
         _lvl_theorem_labels[lvl] = _graph_theorem_arr[pis].tolist()
 
-    del _used_labels_arr, _graph_theorem_arr
+    del _used_labels_arr, _graph_theorem_arr, sorted_graph_pis
 
     del all_node_types, assert_mask_global, assert_positions
-    del sorted_assert_positions, sorted_levels_arr, all_assert_idxs
+    del sorted_levels_arr, all_assert_idxs
     del all_nf, all_ne, all_graph_pis
     _lap("level_bucketing")
 
@@ -1405,79 +1453,65 @@ def pack_levels(
     del push_step_global, _flat_push_enc, push_enc_offsets_arr
     _lap("pack_push_nodes")
 
-    # ── Pack assertion levels via Numba kernel ────────────────────────
+    # ── Pack ALL assertion nodes in one kernel call ───────────────────
+    # One allocation + one Numba dispatch replaces 96 per-level loops that
+    # each allocated multiple large 2D arrays.  Nodes across levels are
+    # independent for packing (each reads its own CSR slice), so prange
+    # over all N is safe.
+    total_asserts = len(sorted_assert_positions)
+    gm_inputs = max(int((sorted_nf + sorted_ne).max()), 1)
+    gm_fhyps  = max(int(sorted_nf.max()), 1)
+    gm_ehyps  = max(int(sorted_ne.max()), 1)
 
-    def _pack_one_level(lvl: int) -> AssertionLevelBatch:
-        pos    = _lvl_positions[lvl]       # global node indices [B]
-        aidx   = _lvl_assert_idxs_np[lvl]  # [B] int32
-        nf_arr = _lvl_nf_np[lvl]           # [B] int32
-        ne_arr = _lvl_ne_np[lvl]           # [B] int32
-        pi_arr = _lvl_graph_pis_np[lvl]    # [B] int32
-        B = len(pos)
+    if verbose:
+        print(f"  Phase 2: packing {total_asserts:,} assertion nodes across "
+              f"{len(sorted_levels)} levels "
+              f"(max_inputs={gm_inputs}, max_fhyps={gm_fhyps}, max_ehyps={gm_ehyps})...",
+              flush=True)
 
-        max_inputs = int((nf_arr + ne_arr).max()) if B > 0 else 1
-        max_fhyps  = int(nf_arr.max()) if B > 0 else 1
-        max_ehyps  = int(ne_arr.max()) if B > 0 else 1
-        max_inputs = max(max_inputs, 1)
-        max_fhyps  = max(max_fhyps, 1)
-        max_ehyps  = max(max_ehyps, 1)
+    all_out_assertion_idx  = np.empty(total_asserts, dtype=np.int32)
+    all_out_input_global   = np.full((total_asserts, gm_inputs), -1, dtype=np.int32)
+    all_out_input_counts   = np.empty(total_asserts, dtype=np.int32)
+    all_out_fhyp_positions = np.zeros((total_asserts, gm_fhyps), dtype=np.int32)
+    all_out_ehyp_positions = np.zeros((total_asserts, gm_ehyps), dtype=np.int32)
+    all_out_output_global  = np.empty(total_asserts, dtype=np.int32)
 
-        # Build local CSR via Numba gather kernel (parallel over B nodes)
-        inp_counts = (all_input_offsets[pos + 1] - all_input_offsets[pos]).astype(np.int32)
-        local_inp_offsets = np.empty(B + 1, dtype=np.int32)
-        local_inp_offsets[0] = 0
-        np.cumsum(inp_counts, out=local_inp_offsets[1:])
-        total_inp = int(local_inp_offsets[-1])
-        local_inp_data = np.empty(total_inp, dtype=np.int32)
-        if total_inp > 0:
-            _nb_gather_csr(
-                pos.astype(np.int32),
-                all_input_offsets,
-                all_input_data,
-                local_inp_offsets,
-                local_inp_data,
-            )
+    _nb_pack_all_assertions(
+        sorted_assert_positions, sorted_assert_idxs,
+        sorted_nf, sorted_ne,
+        all_input_offsets, all_input_data,
+        gm_inputs, gm_fhyps, gm_ehyps,
+        all_out_assertion_idx, all_out_input_global, all_out_input_counts,
+        all_out_fhyp_positions, all_out_ehyp_positions, all_out_output_global,
+    )
 
-        out_assertion_idx  = np.empty(B, dtype=np.int32)
-        out_input_global   = np.full((B, max_inputs), -1, dtype=np.int32)
-        out_input_counts   = np.empty(B, dtype=np.int32)
-        out_fhyp_positions = np.zeros((B, max_fhyps), dtype=np.int32)
-        out_ehyp_positions = np.zeros((B, max_ehyps), dtype=np.int32)
-        out_output_global  = np.empty(B, dtype=np.int32)
+    del sorted_assert_positions, sorted_assert_idxs, sorted_nf, sorted_ne
+    del all_input_offsets, all_input_data, all_node_levels
 
-        _nb_pack_assertion_level(
-            pos.astype(np.int32),   # step indices are already global — kernel uses them as-is
-            pi_arr, aidx,
-            local_inp_offsets, local_inp_data,
-            nf_arr, ne_arr,
-            graph_offsets,
-            max_inputs, max_fhyps, max_ehyps,
-            out_assertion_idx, out_input_global, out_input_counts,
-            out_fhyp_positions, out_ehyp_positions, out_output_global,
-        )
-
-        return AssertionLevelBatch(
+    # Build per-level batches as zero-copy views into the global arrays
+    assertion_batches: list[AssertionLevelBatch] = []
+    for k, lvl in enumerate(sorted_levels):
+        s = int(level_starts[k])
+        e = int(level_ends[k])
+        B = e - s
+        assertion_batches.append(AssertionLevelBatch(
             level=lvl,
             max_level=lvl,
             count=B,
             node_levels=np.full(B, lvl, dtype=np.int32),
             assertion_labels=_lvl_labels[lvl],
             theorem_labels=_lvl_theorem_labels[lvl],
-            assertion_idx=out_assertion_idx,
-            input_global_indices=out_input_global,
-            input_counts=out_input_counts,
-            fhyp_input_positions=out_fhyp_positions,
-            ehyp_input_positions=out_ehyp_positions,
-            output_global_indices=out_output_global,
+            assertion_idx=all_out_assertion_idx[s:e],
+            input_global_indices=all_out_input_global[s:e],
+            input_counts=all_out_input_counts[s:e],
+            fhyp_input_positions=all_out_fhyp_positions[s:e],
+            ehyp_input_positions=all_out_ehyp_positions[s:e],
+            output_global_indices=all_out_output_global[s:e],
             sublevel_ranges=[(0, B)],
-        )
+        ))
 
-    if verbose:
-        print(f"  Phase 2: packing {len(sorted_levels)} levels...", flush=True)
-    assertion_batches = [_pack_one_level(lvl) for lvl in sorted_levels]
-    del _lvl_positions, _lvl_assert_idxs_np, _lvl_nf_np, _lvl_ne_np
-    del _lvl_graph_pis_np, _lvl_labels, _lvl_theorem_labels
-    del all_input_offsets, all_input_data, all_node_levels
+    del _lvl_labels, _lvl_theorem_labels
+    # all_out_* arrays stay alive via views in assertion_batches
     _lap("pack_assertion_levels")
 
     # ── Pre-compute exact expression lengths (packed buffer) ─────────
@@ -2599,6 +2633,23 @@ def warmup_numba() -> None:
         dummy_graph_off,
         1, 1, 1,
         out_aidx, out_ig, out_ic, out_fp, out_ep, out_og,
+    )
+
+    # Warmup _nb_pack_all_assertions (single-call parallel packing kernel)
+    _nb_pack_all_assertions(
+        np.zeros(1, dtype=np.int32),          # sorted_positions
+        np.zeros(1, dtype=np.int32),          # sorted_assert_idxs
+        np.zeros(1, dtype=np.int32),          # sorted_nf
+        np.zeros(1, dtype=np.int32),          # sorted_ne
+        np.array([0, 0], dtype=np.int32),     # all_input_offsets
+        np.zeros(0, dtype=np.int32),          # all_input_data
+        1, 1, 1,                              # max_inputs, max_fhyps, max_ehyps
+        np.zeros(1, dtype=np.int32),
+        np.full((1, 1), -1, dtype=np.int32),
+        np.zeros(1, dtype=np.int32),
+        np.zeros((1, 1), dtype=np.int32),
+        np.zeros((1, 1), dtype=np.int32),
+        np.zeros(1, dtype=np.int32),
     )
 
     # Warmup _nb_compute_expr_lengths_batch (per-level expr length kernel)
