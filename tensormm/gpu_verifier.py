@@ -925,47 +925,49 @@ def _nb_pack_assertion_level(
             out_ehyp_input_positions[b, e] = nf + e
 
 
-@njit(parallel=True, cache=True)
-def _nb_compute_expr_lengths_batch(
-    output_global: np.ndarray,     # [B] int32 — output slot for each node
-    assertion_idxs: np.ndarray,    # [B] int32 — row in AssertionTable
-    input_global: np.ndarray,      # [B, max_inputs] int32 — global input indices (-1=invalid)
-    fhyp_positions: np.ndarray,    # [B, max_fhyps] int32 — which input slot each $f maps to
-    n_fhyps: np.ndarray,           # [B] int32
-    tbl_const_count: np.ndarray,   # [A] int32 — constant token count per assertion pattern
-    tbl_var_occ: np.ndarray,       # [A, max_f] int32 — variable occurrences per fhyp slot
+@njit(cache=True)
+def _nb_compute_all_expr_lengths(
+    level_boundaries: np.ndarray,   # [num_levels+1] int32 — cumsum boundaries into flat arrays
+    all_output_global: np.ndarray,  # [total_asserts] int32
+    all_assertion_idx: np.ndarray,  # [total_asserts] int32
+    all_n_fhyps: np.ndarray,       # [total_asserts] int32
+    all_input_global: np.ndarray,   # [total_asserts, global_max_inputs] int32
+    all_fhyp_pos: np.ndarray,       # [total_asserts, global_max_fhyps] int32
+    tbl_const_count: np.ndarray,   # [A] int32
+    tbl_var_occ: np.ndarray,       # [A, max_f] int32
     node_expr_lengths: np.ndarray, # [total_nodes] int32 — read prev levels, write this level
 ) -> None:
-    """Compute output expression lengths for one sublevel's assertion nodes.
+    """Compute expression lengths for ALL assertion nodes in one call.
 
-    Each thread handles one node: reads input lengths from node_expr_lengths
-    (previous-level slots, no write hazard), sums const_count + var_occ*sub_len
-    for each $f hyp, then writes to its own output slot.  Races are impossible:
-    inputs live in earlier levels, outputs are distinct per node.
+    Processes levels sequentially (respecting data dependencies between levels)
+    with the inner f-loop also in compiled Numba — eliminates all Python loop
+    overhead and numpy temporary allocations from the hot path.
     """
-    B = len(output_global)
-    max_in = input_global.shape[1]
+    max_in = all_input_global.shape[1]
     max_f  = tbl_var_occ.shape[1]
-    for b in prange(B):
-        a_idx = assertion_idxs[b]
-        nf    = n_fhyps[b]
-        out_len = tbl_const_count[a_idx]
-        for f in range(nf):
-            if f >= max_f:
-                break
-            fhyp_pos = fhyp_positions[b, f]
-            if fhyp_pos < 0:
-                fhyp_pos = 0
-            if fhyp_pos >= max_in:
-                fhyp_pos = max_in - 1
-            input_gi = input_global[b, fhyp_pos]
-            if input_gi >= 0:
-                input_len = node_expr_lengths[input_gi]
-                sub_len = input_len - 1
-                if sub_len < 0:
-                    sub_len = 0
-                out_len += tbl_var_occ[a_idx, f] * sub_len
-        node_expr_lengths[output_global[b]] = out_len
+    num_levels = len(level_boundaries) - 1
+    for lvl in range(num_levels):
+        s = level_boundaries[lvl]
+        e = level_boundaries[lvl + 1]
+        for b in range(s, e):
+            a_idx = all_assertion_idx[b]
+            nf = all_n_fhyps[b]
+            out_len = tbl_const_count[a_idx]
+            for f in range(nf):
+                if f >= max_f:
+                    break
+                fhyp_pos = all_fhyp_pos[b, f]
+                if fhyp_pos < 0:
+                    fhyp_pos = 0
+                if fhyp_pos >= max_in:
+                    fhyp_pos = max_in - 1
+                input_gi = all_input_global[b, fhyp_pos]
+                if input_gi >= 0:
+                    sub_len = node_expr_lengths[input_gi] - 1
+                    if sub_len < 0:
+                        sub_len = 0
+                    out_len += tbl_var_occ[a_idx, f] * sub_len
+            node_expr_lengths[all_output_global[b]] = out_len
 
 
 @njit(parallel=True, cache=True)
@@ -1522,38 +1524,48 @@ def pack_levels(
     # Push nodes: length is known directly
     node_expr_lengths[push_global_indices] = push_expr_lengths
 
-    # Assertion nodes: level by level via Numba prange kernel.
-    # Each call processes one sublevel's B nodes fully in parallel — no Python
-    # f-loop, no intermediate numpy allocations.  The kernel reads input lengths
-    # from previous-level slots and writes to distinct output slots (no races).
-    for batch in assertion_batches:
-        if batch.sublevel_ranges is not None:
-            ranges = batch.sublevel_ranges
-        elif batch.level == batch.max_level:
-            ranges = [(0, batch.count)]
-        else:
-            nl = batch.node_levels
-            unique_lvls = np.unique(nl)
-            ranges = []
-            for lv in unique_lvls:
-                idxs = np.where(nl == lv)[0]
-                ranges.append((int(idxs[0]), int(idxs[-1]) + 1))
+    # Assertion nodes: flatten all levels into contiguous arrays, then compute
+    # expression lengths in a single Numba call (no Python loop overhead).
+    # Levels are processed sequentially inside the kernel to respect dependencies.
+    total_asserts = sum(b.count for b in assertion_batches)
+    if total_asserts > 0:
+        global_max_inputs = max(b.input_global_indices.shape[1] for b in assertion_batches)
+        global_max_fhyps  = max(b.fhyp_input_positions.shape[1] for b in assertion_batches)
 
-        for sl_start, sl_end in ranges:
-            B_sl = sl_end - sl_start
-            if B_sl == 0:
-                continue
-            s = slice(sl_start, sl_end)
-            _nb_compute_expr_lengths_batch(
-                batch.output_global_indices[s],
-                batch.assertion_idx[s],
-                batch.input_global_indices[sl_start:sl_end],
-                batch.fhyp_input_positions[sl_start:sl_end],
-                tbl.fhyp_count[batch.assertion_idx[s]],
-                _tbl_const_count,
-                _tbl_var_occ,
-                node_expr_lengths,
-            )
+        flat_output_global  = np.empty(total_asserts, dtype=np.int32)
+        flat_assertion_idx  = np.empty(total_asserts, dtype=np.int32)
+        flat_n_fhyps        = np.empty(total_asserts, dtype=np.int32)
+        flat_input_global   = np.full((total_asserts, global_max_inputs), -1, dtype=np.int32)
+        flat_fhyp_pos       = np.zeros((total_asserts, global_max_fhyps), dtype=np.int32)
+        level_boundaries    = np.empty(len(assertion_batches) + 1, dtype=np.int32)
+        level_boundaries[0] = 0
+
+        offset = 0
+        for li, batch in enumerate(assertion_batches):
+            B = batch.count
+            flat_output_global[offset:offset+B] = batch.output_global_indices
+            flat_assertion_idx[offset:offset+B]  = batch.assertion_idx
+            flat_n_fhyps[offset:offset+B] = tbl.fhyp_count[batch.assertion_idx]
+            w_in = batch.input_global_indices.shape[1]
+            flat_input_global[offset:offset+B, :w_in] = batch.input_global_indices
+            w_fh = batch.fhyp_input_positions.shape[1]
+            flat_fhyp_pos[offset:offset+B, :w_fh] = batch.fhyp_input_positions
+            offset += B
+            level_boundaries[li + 1] = offset
+
+        _nb_compute_all_expr_lengths(
+            level_boundaries,
+            flat_output_global,
+            flat_assertion_idx,
+            flat_n_fhyps,
+            flat_input_global,
+            flat_fhyp_pos,
+            _tbl_const_count,
+            _tbl_var_occ,
+            node_expr_lengths,
+        )
+        del flat_output_global, flat_assertion_idx, flat_n_fhyps
+        del flat_input_global, flat_fhyp_pos, level_boundaries
 
     total_expr_tokens = int(node_expr_lengths.sum())
     del _tbl_const_count, _tbl_var_occ
@@ -2599,17 +2611,17 @@ def warmup_numba() -> None:
         out_aidx, out_ig, out_ic, out_fp, out_ep, out_og,
     )
 
-    dummy_out_g   = np.zeros(1, dtype=np.int32)
-    dummy_aidxs   = np.zeros(1, dtype=np.int32)
-    dummy_in_g    = np.zeros((1, 1), dtype=np.int32)
-    dummy_fhyp_p  = np.zeros((1, 1), dtype=np.int32)
-    dummy_nf      = np.zeros(1, dtype=np.int32)
-    dummy_cc      = np.zeros(1, dtype=np.int32)
-    dummy_vo      = np.zeros((1, 1), dtype=np.int32)
-    dummy_nel     = np.zeros(1, dtype=np.int32)
-    _nb_compute_expr_lengths_batch(
-        dummy_out_g, dummy_aidxs, dummy_in_g, dummy_fhyp_p,
-        dummy_nf, dummy_cc, dummy_vo, dummy_nel,
+    # Warmup _nb_compute_all_expr_lengths (single-call expr length kernel)
+    _nb_compute_all_expr_lengths(
+        np.array([0, 1], dtype=np.int32),   # level_boundaries: 1 level, 1 node
+        np.zeros(1, dtype=np.int32),         # output_global
+        np.zeros(1, dtype=np.int32),         # assertion_idx
+        np.zeros(1, dtype=np.int32),         # n_fhyps
+        np.zeros((1, 1), dtype=np.int32),    # input_global
+        np.zeros((1, 1), dtype=np.int32),    # fhyp_pos
+        np.zeros(1, dtype=np.int32),         # tbl_const_count
+        np.zeros((1, 1), dtype=np.int32),    # tbl_var_occ
+        np.zeros(1, dtype=np.int32),         # node_expr_lengths
     )
 
     _NUMBA_WARMED_UP = True

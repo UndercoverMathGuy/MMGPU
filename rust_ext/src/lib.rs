@@ -668,7 +668,11 @@ fn check_dv_all<'py>(
             let mut active_dv = std::collections::HashSet::with_capacity((dv_e - dv_s) / 2);
             let mut i = 0;
             while i + 1 < dv_slice.len() {
-                active_dv.insert((dv_slice[i], dv_slice[i + 1]));
+                // Canonicalize by integer ordering — the serialised data uses
+                // string-canonical ordering which may differ from sym_id ordering.
+                let a = dv_slice[i];
+                let b = dv_slice[i + 1];
+                active_dv.insert((a.min(b), a.max(b)));
                 i += 2;
             }
 
