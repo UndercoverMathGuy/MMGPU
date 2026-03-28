@@ -390,30 +390,18 @@ fn bytes_of_i32(v: &[i32]) -> &[u8] {
 
 // ── $d post-check ─────────────────────────────────────────────────────────────
 
-/// Collect variable sym_ids that appear in a fully-substituted expression.
+/// Collect variable sym_ids that appear in an expression.
 /// `expr` is a sym_id slice (no type code).
-/// For each token: if it's a variable AND in subst, recurse into subst value;
-/// otherwise if it's a variable, emit it directly.
-fn vars_in_substituted(
+/// Simply returns every token that is a variable — no substitution lookup.
+/// Stack values are already fully concrete, so no further expansion is needed.
+fn vars_in_expr(
     expr: &[i32],
-    subst: &std::collections::HashMap<i32, Vec<i32>>,  // var_id → expr (no type code)
     is_variable: &[u8],
 ) -> Vec<i32> {
     let mut out = Vec::new();
     for &tok in expr {
-        let is_var = (tok as usize) < is_variable.len() && is_variable[tok as usize] != 0;
-        if is_var {
-            if let Some(s) = subst.get(&tok) {
-                // substituted — recurse into substitution value
-                for &v in s {
-                    let sv = (v as usize) < is_variable.len() && is_variable[v as usize] != 0;
-                    if sv {
-                        out.push(v);
-                    }
-                }
-            } else {
-                out.push(tok);
-            }
+        if (tok as usize) < is_variable.len() && is_variable[tok as usize] != 0 {
+            out.push(tok);
         }
     }
     out
@@ -544,7 +532,7 @@ fn check_dv_one(
                             && is_variable[x as usize] != 0;
                         if is_var { vec![x] } else { vec![] }
                     } else {
-                        vars_in_substituted(x_expr, &subst, is_variable)
+                        vars_in_expr(x_expr, is_variable)
                     };
 
                     let sy = if y_expr.is_empty() {
@@ -552,7 +540,7 @@ fn check_dv_one(
                             && is_variable[y as usize] != 0;
                         if is_var { vec![y] } else { vec![] }
                     } else {
-                        vars_in_substituted(y_expr, &subst, is_variable)
+                        vars_in_expr(y_expr, is_variable)
                     };
 
                     for &v in &sx {
