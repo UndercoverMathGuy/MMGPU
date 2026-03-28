@@ -8,7 +8,7 @@
 #   docker run mmgpu-cuda
 # ────────────────────────────────────────────────────────────────────
 
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV NVIDIA_VISIBLE_DEVICES=all
@@ -30,9 +30,9 @@ RUN cargo install --git https://github.com/metamath/metamath-knife --locked
 
 WORKDIR /app
 
-# Install PyTorch with CUDA 12.6 support + deps (includes maturin for Rust ext)
+# Install PyTorch with CUDA 12.8 support + deps (includes maturin for Rust ext)
 RUN python3 -m pip install --break-system-packages --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cu126 \
+    torch --index-url https://download.pytorch.org/whl/cu128 \
     && python3 -m pip install --break-system-packages --no-cache-dir \
     numpy pytest ninja maturin numba
 
