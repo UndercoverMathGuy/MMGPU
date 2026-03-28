@@ -71,6 +71,7 @@ COPY pyproject.toml .
 COPY tensormm/ tensormm/
 COPY run_setmm.py .
 COPY run_all.py .
+COPY benchmark_scaling.py .
 
 # Default: run set.mm verification + full test suite
-CMD ["python3", "run_all.py"]
+CMD ["python3", "benchmark_scaling.py"]
