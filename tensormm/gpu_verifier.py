@@ -925,7 +925,7 @@ def _nb_pack_assertion_level(
             out_ehyp_input_positions[b, e] = nf + e
 
 
-@njit(parallel=True, cache=True)
+@njit(cache=True)
 def _nb_compute_expr_lengths_batch(
     output_global: np.ndarray,     # [B] int32
     assertion_idxs: np.ndarray,    # [B] int32
@@ -938,15 +938,15 @@ def _nb_compute_expr_lengths_batch(
 ) -> None:
     """Compute expression lengths for one level's assertion nodes.
 
-    Called once per level (~300 calls total).  Nodes within a level are
-    independent (inputs come from earlier levels), so prange is safe.
-    The f-loop runs in compiled Numba, eliminating the ~48k numpy temporary
-    allocations that the old vectorised approach required.
+    Called once per level (~300 calls).  Uses range (not prange) because the
+    thread-pool synchronisation cost of 300 prange dispatches far exceeds the
+    compute saved.  The f-loop in compiled Numba already eliminates the ~48k
+    numpy temporary allocations that the old vectorised approach required.
     """
     B = len(output_global)
     max_in = input_global.shape[1]
     max_f  = tbl_var_occ.shape[1]
-    for b in prange(B):
+    for b in range(B):
         a_idx = assertion_idxs[b]
         nf = tbl_fhyp_count[a_idx]
         out_len = tbl_const_count[a_idx]
@@ -992,11 +992,18 @@ def pack_levels(
     verbose: bool = False,
 ) -> GlobalPlan:
     """Pack all proof graphs into level-indexed GPU-ready tensors."""
+    import time as _time
+    _t0 = _time.perf_counter()
+    def _lap(name: str) -> None:
+        nonlocal _t0
+        now = _time.perf_counter()
+        if verbose:
+            print(f"  Phase 2 [{name}]: {now - _t0:.3f}s", flush=True)
+        _t0 = now
     if verbose:
         print(f"  Phase 2: building label_info ({len(parsed.assertions)} assertions)...", flush=True)
     label_info = _build_label_info(parsed)
-    if verbose:
-        print(f"  Phase 2: label_info done, assigning global indices...", flush=True)
+    _lap("label_info")
 
     # ── Assign global buffer indices ─────────────────────────────────
     # Use a simple offset array instead of a dict.  Nodes within each graph
@@ -1047,6 +1054,7 @@ def pack_levels(
         if len(g.expected_conclusion) > max_expr_len:
             max_expr_len = len(g.expected_conclusion)
     max_expr_len = min(max_expr_len, _EXPR_BUF_CAP)
+    _lap("global_indices+max_expr")
 
     # ── Build AssertionTable: one row per unique assertion label ─────
     # Collect all unique assertion labels actually used across all graphs.
@@ -1142,6 +1150,7 @@ def pack_levels(
     del tbl_pattern_toks, tbl_pattern_lengths
     del tbl_fhyp_var_ids, tbl_fhyp_count
     del tbl_ehyp_patterns, tbl_ehyp_pattern_lengths, tbl_ehyp_count
+    _lap("assertion_table")
 
     # ── Build global per-node arrays (pure numpy concatenation, no Python loops) ──
     # Concatenate all graphs' arrays into single global arrays indexed by global_idx.
@@ -1236,6 +1245,8 @@ def pack_levels(
         goff = int(graph_offsets[pi])
         all_graph_pis[goff: goff + g.num_nodes] = pi
 
+    _lap("global_arrays")
+
     # ── Push nodes: encode expressions and build flat CSR ────────────
     # Fast path: if all graphs have pre-encoded token IDs (from the Rust path
     # with tokenizer), just concatenate them — no _enc() calls needed.
@@ -1320,6 +1331,8 @@ def pack_levels(
         del unique_push_exprs, push_unique_ids, unique_encs
         del push_uid_arr, per_node_lengths, uid_enc_flat, uid_enc_offsets_k, uid_enc_lengths
 
+    _lap("push_nodes")
+
     # ── Level bucketing: pure numpy, no Python per-node loop ─────────
     # Sort assertion nodes by level using argsort; split into contiguous level groups.
     assert_levels  = all_node_levels[assert_positions]  # [num_assertions]
@@ -1370,6 +1383,7 @@ def pack_levels(
     del all_node_types, assert_mask_global, assert_positions
     del sorted_assert_positions, sorted_levels_arr, all_assert_idxs
     del all_nf, all_ne, all_graph_pis
+    _lap("level_bucketing")
 
     # ── Pack push nodes ───────────────────────────────────────────────
     num_push = len(push_step_global)
@@ -1389,6 +1403,7 @@ def pack_levels(
             push_expressions,
         )
     del push_step_global, _flat_push_enc, push_enc_offsets_arr
+    _lap("pack_push_nodes")
 
     # ── Pack assertion levels via Numba kernel ────────────────────────
 
@@ -1463,6 +1478,7 @@ def pack_levels(
     del _lvl_positions, _lvl_assert_idxs_np, _lvl_nf_np, _lvl_ne_np
     del _lvl_graph_pis_np, _lvl_labels, _lvl_theorem_labels
     del all_input_offsets, all_input_data, all_node_levels
+    _lap("pack_assertion_levels")
 
     # ── Pre-compute exact expression lengths (packed buffer) ─────────
     # The substitution output length depends only on the assertion pattern
@@ -1541,6 +1557,7 @@ def pack_levels(
 
     total_expr_tokens = int(node_expr_lengths.sum())
     del _tbl_const_count, _tbl_var_occ
+    _lap("expr_lengths")
 
     if verbose:
         avg_len = total_expr_tokens / max(total_nodes, 1)
@@ -1574,6 +1591,7 @@ def pack_levels(
         expected_conclusion_hashes[pi] = _poly_hash_np(enc)
     # Free encoding cache and label_info — no longer needed after this point
     del _enc_cache, label_info
+    _lap("final_check_data")
 
     return GlobalPlan(
         total_nodes=total_nodes,
