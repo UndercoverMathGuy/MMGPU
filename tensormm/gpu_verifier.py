@@ -784,15 +784,9 @@ class AssertionLevelBatch:
     # Index into AssertionTable for each node
     assertion_idx: np.ndarray            # [B] int32
 
-    # Per-node input mapping
-    input_global_indices: np.ndarray     # [B, max_inputs] int32 — -1 for padding
-    input_counts: np.ndarray             # [B] int32
-
-    # Floating hyp input positions (which input slot holds each $f value)
-    fhyp_input_positions: np.ndarray     # [B, max_fhyps] int32
-
-    # Essential hyp input positions (which input slot holds each $e value)
-    ehyp_input_positions: np.ndarray     # [B, max_ehyps] int32
+    # Per-node input mapping (flat CSR — no padded 2D array)
+    input_global_flat: np.ndarray        # [total_inputs] int32 — flat CSR data
+    input_global_offsets: np.ndarray     # [B+1] int32 — CSR offsets
 
     # Output: where to write in expr_buffer
     output_global_indices: np.ndarray    # [B] int32
@@ -813,10 +807,11 @@ class GlobalPlan:
     # Shared assertion lookup table (deduplicated)
     assertion_table: AssertionTable
 
-    # Level 0 push data
-    push_global_indices: np.ndarray    # [num_push] int32
-    push_expressions: np.ndarray       # [num_push, push_width] int32
-    push_expr_lengths: np.ndarray      # [num_push] int32
+    # Level 0 push data (flat CSR — no padded 2D array)
+    push_global_indices: np.ndarray        # [num_push] int32
+    push_expressions_flat: np.ndarray      # [total_push_tokens] int16 — flat CSR data
+    push_expressions_offsets: np.ndarray   # [num_push+1] int32 — CSR offsets
+    push_expr_lengths: np.ndarray          # [num_push] int32
 
     # Assertion levels (sorted by level)
     assertion_batches: list[AssertionLevelBatch]
@@ -981,14 +976,14 @@ def _nb_pack_all_assertions(
 
 @njit(cache=True)
 def _nb_compute_expr_lengths_batch(
-    output_global: np.ndarray,     # [B] int32
-    assertion_idxs: np.ndarray,    # [B] int32
-    input_global: np.ndarray,      # [B, max_inputs] int32
-    fhyp_positions: np.ndarray,    # [B, max_fhyps] int32
-    tbl_fhyp_count: np.ndarray,   # [A] int32 — shared, indexed by assertion row
-    tbl_const_count: np.ndarray,   # [A] int32
-    tbl_var_occ: np.ndarray,       # [A, max_f] int32
-    node_expr_lengths: np.ndarray, # [total_nodes] int32 — read prev levels, write this level
+    output_global: np.ndarray,       # [B] int32
+    assertion_idxs: np.ndarray,      # [B] int32
+    input_global_flat: np.ndarray,   # [total_inputs] int32 — flat CSR data
+    input_global_offsets: np.ndarray, # [B+1] int32 — CSR offsets
+    tbl_fhyp_count: np.ndarray,     # [A] int32 — shared, indexed by assertion row
+    tbl_const_count: np.ndarray,     # [A] int32
+    tbl_var_occ: np.ndarray,         # [A, max_f] int32
+    node_expr_lengths: np.ndarray,   # [total_nodes] int32 — read prev levels, write this level
 ) -> None:
     """Compute expression lengths for one level's assertion nodes.
 
@@ -998,26 +993,24 @@ def _nb_compute_expr_lengths_batch(
     numpy temporary allocations that the old vectorised approach required.
     """
     B = len(output_global)
-    max_in = input_global.shape[1]
     max_f  = tbl_var_occ.shape[1]
     for b in range(B):
         a_idx = assertion_idxs[b]
         nf = tbl_fhyp_count[a_idx]
         out_len = tbl_const_count[a_idx]
+        inp_start = input_global_offsets[b]
+        n_inputs = input_global_offsets[b + 1] - inp_start
         for f in range(nf):
             if f >= max_f:
                 break
-            fhyp_pos = fhyp_positions[b, f]
-            if fhyp_pos < 0:
-                fhyp_pos = 0
-            if fhyp_pos >= max_in:
-                fhyp_pos = max_in - 1
-            input_gi = input_global[b, fhyp_pos]
-            if input_gi >= 0:
-                sub_len = node_expr_lengths[input_gi] - 1
-                if sub_len < 0:
-                    sub_len = 0
-                out_len += tbl_var_occ[a_idx, f] * sub_len
+            # fhyp f is always at input position f
+            if f < n_inputs:
+                input_gi = input_global_flat[inp_start + f]
+                if input_gi >= 0:
+                    sub_len = node_expr_lengths[input_gi] - 1
+                    if sub_len < 0:
+                        sub_len = 0
+                    out_len += tbl_var_occ[a_idx, f] * sub_len
         node_expr_lengths[output_global[b]] = out_len
 
 
@@ -1433,67 +1426,66 @@ def pack_levels(
     del all_nf, all_ne, all_graph_pis
     _lap("level_bucketing")
 
-    # ── Pack push nodes ───────────────────────────────────────────────
+    # ── Pack push nodes (flat CSR — no padded 2D array) ────────────
     num_push = len(push_step_global)
-    max_push_width = max((g.max_push_expr_len for g in graphs), default=1)
     if verbose:
-        print(f"  Phase 2: packing {num_push:,} push nodes, {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
+        print(f"  Phase 2: packing {num_push:,} push nodes (flat CSR), {len(sorted_levels)} levels, max_expr_len={max_expr_len}...", flush=True)
 
     push_global_indices = np.array(push_step_global, dtype=np.int32)
     push_expr_lengths   = np.diff(push_enc_offsets_arr).astype(np.int32)
-    push_expressions    = np.zeros((num_push, max_push_width), dtype=np.int16)
-    if num_push > 0:
-        # Fill push_expressions: scatter each encoded token list into its row.
-        # Use the Numba kernel for the parallel row-fill (main cost is memory bandwidth).
-        _nb_fill_push_expressions(
-            _flat_push_enc,
-            push_enc_offsets_arr,
-            push_expressions,
-        )
-    del push_step_global, _flat_push_enc, push_enc_offsets_arr
+    # Keep flat CSR directly — no padded 2D allocation needed
+    push_expressions_flat = _flat_push_enc        # [total_push_tokens] int16
+    push_expressions_offsets = push_enc_offsets_arr  # [num_push+1] int32
+    del push_step_global
     _lap("pack_push_nodes")
 
-    # ── Pack ALL assertion nodes in one kernel call ───────────────────
-    # One allocation + one Numba dispatch replaces 96 per-level loops that
-    # each allocated multiple large 2D arrays.  Nodes across levels are
-    # independent for packing (each reads its own CSR slice), so prange
-    # over all N is safe.
+    # ── Gather CSR data into level-sorted order (sequential access) ─
+    # sorted_assert_positions is sorted by level, not by global node index.
+    # Reading all_input_offsets[sorted_positions[b]] is random access that
+    # thrashes L3 cache at scale.  Gather into local CSR first.
     total_asserts = len(sorted_assert_positions)
-    gm_inputs = max(int((sorted_nf + sorted_ne).max()), 1)
-    gm_fhyps  = max(int(sorted_nf.max()), 1)
-    gm_ehyps  = max(int(sorted_ne.max()), 1)
 
     if verbose:
-        print(f"  Phase 2: packing {total_asserts:,} assertion nodes across "
-              f"{len(sorted_levels)} levels "
-              f"(max_inputs={gm_inputs}, max_fhyps={gm_fhyps}, max_ehyps={gm_ehyps})...",
+        print(f"  Phase 2: gathering CSR for {total_asserts:,} assertion nodes...",
               flush=True)
 
-    all_out_assertion_idx  = np.empty(total_asserts, dtype=np.int32)
-    all_out_input_global   = np.full((total_asserts, gm_inputs), -1, dtype=np.int32)
-    all_out_input_counts   = np.empty(total_asserts, dtype=np.int32)
-    all_out_fhyp_positions = np.zeros((total_asserts, gm_fhyps), dtype=np.int32)
-    all_out_ehyp_positions = np.zeros((total_asserts, gm_ehyps), dtype=np.int32)
-    all_out_output_global  = np.empty(total_asserts, dtype=np.int32)
+    # Compute per-node input counts from global CSR
+    local_counts = (all_input_offsets[sorted_assert_positions + 1]
+                    - all_input_offsets[sorted_assert_positions]).astype(np.int32)
+    local_offsets = np.empty(total_asserts + 1, dtype=np.int32)
+    local_offsets[0] = 0
+    np.cumsum(local_counts, out=local_offsets[1:])
+    total_local_inputs = int(local_offsets[total_asserts])
+    local_data = np.empty(total_local_inputs, dtype=np.int32)
 
-    _nb_pack_all_assertions(
-        sorted_assert_positions, sorted_assert_idxs,
-        sorted_nf, sorted_ne,
-        all_input_offsets, all_input_data,
-        gm_inputs, gm_fhyps, gm_ehyps,
-        all_out_assertion_idx, all_out_input_global, all_out_input_counts,
-        all_out_fhyp_positions, all_out_ehyp_positions, all_out_output_global,
-    )
+    if total_local_inputs > 0:
+        _nb_gather_csr(
+            sorted_assert_positions, all_input_offsets, all_input_data,
+            local_offsets, local_data,
+        )
 
-    del sorted_assert_positions, sorted_assert_idxs, sorted_nf, sorted_ne
-    del all_input_offsets, all_input_data, all_node_levels
+    del all_input_offsets, all_input_data
 
-    # Build per-level batches as zero-copy views into the global arrays
+    # ── Build per-level batches as flat CSR views ─────────────────────
+    # assertion_idx and output_global come from the sorted arrays directly.
+    # input data comes from the gathered local CSR.
+    # fhyp/ehyp positions are trivially [0..nf) and [nf..nf+ne) — computed
+    # on-the-fly by the CUDA kernel from tbl_fhyp_count, so not stored.
+
+    all_out_assertion_idx = sorted_assert_idxs   # already in level order
+    all_out_output_global = sorted_assert_positions.astype(np.int32)
+
     assertion_batches: list[AssertionLevelBatch] = []
     for k, lvl in enumerate(sorted_levels):
         s = int(level_starts[k])
         e = int(level_ends[k])
         B = e - s
+        # Slice the local CSR for this level
+        inp_s = int(local_offsets[s])
+        inp_e = int(local_offsets[e])
+        # Re-base offsets to start at 0 for this batch
+        batch_offsets = local_offsets[s:e + 1] - inp_s
+
         assertion_batches.append(AssertionLevelBatch(
             level=lvl,
             max_level=lvl,
@@ -1502,16 +1494,15 @@ def pack_levels(
             assertion_labels=_lvl_labels[lvl],
             theorem_labels=_lvl_theorem_labels[lvl],
             assertion_idx=all_out_assertion_idx[s:e],
-            input_global_indices=all_out_input_global[s:e],
-            input_counts=all_out_input_counts[s:e],
-            fhyp_input_positions=all_out_fhyp_positions[s:e],
-            ehyp_input_positions=all_out_ehyp_positions[s:e],
+            input_global_flat=local_data[inp_s:inp_e],
+            input_global_offsets=batch_offsets,
             output_global_indices=all_out_output_global[s:e],
             sublevel_ranges=[(0, B)],
         ))
 
     del _lvl_labels, _lvl_theorem_labels
-    # all_out_* arrays stay alive via views in assertion_batches
+    del sorted_assert_positions, sorted_assert_idxs, sorted_nf, sorted_ne
+    del all_node_levels, local_counts, local_offsets, local_data
     _lap("pack_assertion_levels")
 
     # ── Pre-compute exact expression lengths (packed buffer) ─────────
@@ -1581,8 +1572,8 @@ def pack_levels(
             _nb_compute_expr_lengths_batch(
                 batch.output_global_indices,
                 batch.assertion_idx,
-                batch.input_global_indices,
-                batch.fhyp_input_positions,
+                batch.input_global_flat,
+                batch.input_global_offsets,
                 _tbl_fhyp_count,
                 _tbl_const_count,
                 _tbl_var_occ,
@@ -1633,7 +1624,8 @@ def pack_levels(
         num_proofs=num_proofs,
         assertion_table=assertion_table,
         push_global_indices=push_global_indices,
-        push_expressions=push_expressions,
+        push_expressions_flat=push_expressions_flat,
+        push_expressions_offsets=push_expressions_offsets,
         push_expr_lengths=push_expr_lengths,
         assertion_batches=assertion_batches,
         final_node_indices=final_node_indices,
@@ -1884,20 +1876,14 @@ def _merge_sparse_levels(
         if len(pending) == 1:
             merged.append(pending[0])
         else:
-            m_max_inputs = max(b.input_global_indices.shape[1] for b in pending)
-            m_max_fhyps  = max(b.fhyp_input_positions.shape[1] for b in pending)
-            m_max_ehyps  = max(b.ehyp_input_positions.shape[1] for b in pending)
             B_total = sum(b.count for b in pending)
+            total_inputs = sum(len(b.input_global_flat) for b in pending)
 
-            # Pre-allocate final arrays and fill in one pass instead of
-            # creating padded copies per batch then concatenating.
-            m_input_global  = np.full((B_total, m_max_inputs), -1, dtype=np.int32)
             m_node_levels   = np.empty(B_total, dtype=np.int32)
             m_assertion_idx = np.empty(B_total, dtype=np.int32)
-            m_input_counts  = np.empty(B_total, dtype=np.int32)
-            m_fhyp_pos      = np.zeros((B_total, m_max_fhyps), dtype=np.int32)
-            m_ehyp_pos      = np.zeros((B_total, m_max_ehyps), dtype=np.int32)
             m_output_global = np.empty(B_total, dtype=np.int32)
+            m_input_flat    = np.empty(total_inputs, dtype=np.int32)
+            m_input_offsets = np.empty(B_total + 1, dtype=np.int32)
             m_assertion_labels: list[str] = []
             m_theorem_labels: list[str] = []
 
@@ -1905,23 +1891,23 @@ def _merge_sparse_levels(
             # doesn't need np.unique + np.where at runtime.
             m_sublevel_ranges: list[tuple[int, int]] = []
             row = 0
+            flat_pos = 0
             for b in pending:
                 nr = b.count
                 r = slice(row, row + nr)
                 m_sublevel_ranges.append((row, row + nr))
                 m_node_levels[r]   = b.node_levels
                 m_assertion_idx[r] = b.assertion_idx
-                m_input_counts[r]  = b.input_counts
                 m_output_global[r] = b.output_global_indices
-                w_in = b.input_global_indices.shape[1]
-                m_input_global[r, :w_in] = b.input_global_indices
-                w_f = b.fhyp_input_positions.shape[1]
-                m_fhyp_pos[r, :w_f] = b.fhyp_input_positions
-                w_e = b.ehyp_input_positions.shape[1]
-                m_ehyp_pos[r, :w_e] = b.ehyp_input_positions
+                # Merge flat CSR: copy data and rebase offsets
+                b_ndata = len(b.input_global_flat)
+                m_input_flat[flat_pos:flat_pos + b_ndata] = b.input_global_flat
+                m_input_offsets[row:row + nr] = b.input_global_offsets[:nr] + flat_pos
                 m_assertion_labels.extend(b.assertion_labels)
                 m_theorem_labels.extend(b.theorem_labels)
+                flat_pos += b_ndata
                 row += nr
+            m_input_offsets[B_total] = flat_pos
 
             merged.append(AssertionLevelBatch(
                 level=pending[0].level,
@@ -1931,10 +1917,8 @@ def _merge_sparse_levels(
                 assertion_labels=m_assertion_labels,
                 theorem_labels=m_theorem_labels,
                 assertion_idx=m_assertion_idx,
-                input_global_indices=m_input_global,
-                input_counts=m_input_counts,
-                fhyp_input_positions=m_fhyp_pos,
-                ehyp_input_positions=m_ehyp_pos,
+                input_global_flat=m_input_flat,
+                input_global_offsets=m_input_offsets,
                 output_global_indices=m_output_global,
                 sublevel_ranges=m_sublevel_ranges,
             ))
@@ -1979,8 +1963,8 @@ def _execute_level(
     Pattern and ehyp data are gathered from the shared assertion table
     (one row per unique assertion, already on device) rather than being
     stored redundantly per node.  Per-batch arrays are only the small
-    node-specific fields: assertion_idx, input_global_indices,
-    fhyp_input_positions, ehyp_input_positions, output_global_indices.
+    node-specific fields: assertion_idx, input_global_flat/offsets,
+    output_global_indices.
 
     Stores a polynomial rolling hash of each conclusion in expr_hashes so
     that expressions longer than max_expr_len can still be compared correctly
@@ -2000,23 +1984,34 @@ def _execute_level(
         return t.long() if long else t
 
     asrt_idx_t     = _to(batch.assertion_idx, long=True)           # [B]
-    input_global_t = _to(batch.input_global_indices, long=True)   # [B, max_inputs]
-    input_counts_t = _to(batch.input_counts)                      # [B]
     output_global_t = _to(batch.output_global_indices, long=True) # [B]
 
-    # Position arrays may be narrower than the table's max_fhyps/max_ehyps
-    # (e.g. when batches with few hyps are merged). Pad with 0 so that
-    # out-of-range positions are masked away by fhyp_valid/ehyp_valid.
+    # Reconstruct padded 2D input_global_indices from flat CSR for PyTorch path
+    # (needed for fancy indexing into expr_buffer [total_nodes, max_expr_len])
+    max_inputs = int(np.diff(batch.input_global_offsets).max()) if B > 0 else 1
+    input_global_np = np.full((B, max_inputs), -1, dtype=np.int32)
+    for b_i in range(B):
+        s = int(batch.input_global_offsets[b_i])
+        e = int(batch.input_global_offsets[b_i + 1])
+        n = e - s
+        input_global_np[b_i, :n] = batch.input_global_flat[s:e]
+    input_global_t = _to(input_global_np, long=True)   # [B, max_inputs]
+    input_counts_np = np.diff(batch.input_global_offsets).astype(np.int32)
+    input_counts_t = _to(input_counts_np)              # [B]
+
+    # Reconstruct fhyp/ehyp position arrays (trivially sequential)
     tbl_max_fhyps = tbl_fhyp_var_ids.shape[1]
     tbl_max_ehyps = tbl_ehyp_patterns.shape[1]
-    fhyp_pos_np = batch.fhyp_input_positions
-    ehyp_pos_np = batch.ehyp_input_positions
-    if fhyp_pos_np.shape[1] < tbl_max_fhyps:
-        fhyp_pos_np = np.pad(fhyp_pos_np, ((0, 0), (0, tbl_max_fhyps - fhyp_pos_np.shape[1])))
-    if ehyp_pos_np.shape[1] < tbl_max_ehyps:
-        ehyp_pos_np = np.pad(ehyp_pos_np, ((0, 0), (0, tbl_max_ehyps - ehyp_pos_np.shape[1])))
-    fhyp_pos_t = _to(fhyp_pos_np, long=True)  # [B, tbl_max_fhyps]
-    ehyp_pos_t = _to(ehyp_pos_np, long=True)  # [B, tbl_max_ehyps]
+    # fhyp f is at input position f; ehyp e is at input position nf + e
+    fhyp_pos_np = np.zeros((B, tbl_max_fhyps), dtype=np.int32)
+    ehyp_pos_np = np.zeros((B, tbl_max_ehyps), dtype=np.int32)
+    nf_arr = tbl_fhyp_count[asrt_idx_t].cpu().numpy().astype(np.int32)
+    for f in range(tbl_max_fhyps):
+        fhyp_pos_np[:, f] = f
+    for e in range(tbl_max_ehyps):
+        ehyp_pos_np[:, e] = nf_arr + e
+    fhyp_pos_t = _to(fhyp_pos_np, long=True)
+    ehyp_pos_t = _to(ehyp_pos_np, long=True)
 
     # ── Gather per-node assertion data from table ─────────────────────
     # [B, P], [B], [B, max_fhyps], [B], [B, max_ehyps, E], [B, max_ehyps], [B]
@@ -2223,7 +2218,8 @@ def _run_gpu_pipeline_cuda(
     if len(plan.push_global_indices) > 0:
         _cuda_mod.cuda_push_nodes(
             plan.push_global_indices,
-            plan.push_expressions,
+            plan.push_expressions_flat,
+            plan.push_expressions_offsets,
             plan.push_expr_lengths,
             expr_buffer, expr_lengths, expr_hashes,
             expr_offsets,
@@ -2274,10 +2270,8 @@ def _run_gpu_pipeline_cuda(
 
         _cuda_mod.cuda_execute_level(
             batch.assertion_idx,
-            batch.input_global_indices,
-            batch.input_counts,
-            batch.fhyp_input_positions,
-            batch.ehyp_input_positions,
+            batch.input_global_flat,
+            batch.input_global_offsets,
             batch.output_global_indices,
             sublevel_ranges,
             tbl_pattern_toks_t, tbl_pattern_lengths_t,
@@ -2366,10 +2360,16 @@ def _run_gpu_pipeline(
     if len(plan.push_global_indices) > 0:
         push_idx = torch.from_numpy(plan.push_global_indices).long().to(device)
 
-        push_exprs_np = plan.push_expressions
-        pw = push_exprs_np.shape[1]
-        if pw > max_expr_len:
-            push_exprs_np = push_exprs_np[:, :max_expr_len]
+        # Reconstruct padded 2D from flat CSR for PyTorch scatter
+        num_push = len(plan.push_global_indices)
+        pw = int(np.diff(plan.push_expressions_offsets).max()) if num_push > 0 else 0
+        pw = min(pw, max_expr_len)
+        push_exprs_np = np.zeros((num_push, pw), dtype=np.int16)
+        for i in range(num_push):
+            s = int(plan.push_expressions_offsets[i])
+            e = int(plan.push_expressions_offsets[i + 1])
+            n = min(e - s, pw)
+            push_exprs_np[i, :n] = plan.push_expressions_flat[s:s + n]
 
         if use_pinned:
             push_exprs_t = torch.from_numpy(push_exprs_np).pin_memory().to(device, non_blocking=True)
@@ -2656,8 +2656,8 @@ def warmup_numba() -> None:
     _nb_compute_expr_lengths_batch(
         np.zeros(1, dtype=np.int32),         # output_global
         np.zeros(1, dtype=np.int32),         # assertion_idxs
-        np.zeros((1, 1), dtype=np.int32),    # input_global
-        np.zeros((1, 1), dtype=np.int32),    # fhyp_positions
+        np.zeros(0, dtype=np.int32),         # input_global_flat
+        np.array([0, 0], dtype=np.int32),    # input_global_offsets
         np.zeros(1, dtype=np.int32),         # tbl_fhyp_count
         np.zeros(1, dtype=np.int32),         # tbl_const_count
         np.zeros((1, 1), dtype=np.int32),    # tbl_var_occ
@@ -2705,10 +2705,24 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
 
     push_gi_a = plan.push_global_indices[push_mask_a]
     push_gi_b = plan.push_global_indices[push_mask_b] - offset_split  # re-base
-    push_ex_a = plan.push_expressions[push_mask_a]
-    push_ex_b = plan.push_expressions[push_mask_b]
     push_el_a = plan.push_expr_lengths[push_mask_a]
     push_el_b = plan.push_expr_lengths[push_mask_b]
+
+    # Split flat CSR push expressions by mask
+    def _split_flat_csr(mask, flat, offsets):
+        idx = np.where(mask)[0]
+        if len(idx) == 0:
+            return np.empty(0, dtype=flat.dtype), np.zeros(1, dtype=offsets.dtype)
+        new_flat_parts = [flat[offsets[i]:offsets[i + 1]] for i in idx]
+        new_flat = np.concatenate(new_flat_parts) if new_flat_parts else np.empty(0, dtype=flat.dtype)
+        lengths = np.array([offsets[i + 1] - offsets[i] for i in idx], dtype=offsets.dtype)
+        new_offsets = np.empty(len(idx) + 1, dtype=offsets.dtype)
+        new_offsets[0] = 0
+        np.cumsum(lengths, out=new_offsets[1:])
+        return new_flat, new_offsets
+
+    push_flat_a, push_off_a = _split_flat_csr(push_mask_a, plan.push_expressions_flat, plan.push_expressions_offsets)
+    push_flat_b, push_off_b = _split_flat_csr(push_mask_b, plan.push_expressions_flat, plan.push_expressions_offsets)
 
     # ── Re-base per-proof final indices ──────────────────────────────
     final_a_rebased = final_a.copy()  # already in [0, offset_split)
@@ -2725,10 +2739,11 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
                 return None
             idx = np.where(mask)[0]
             new_out = batch.output_global_indices[mask] - rebase
-            new_in  = batch.input_global_indices[mask].copy()
-            # Remap non-sentinel input indices
-            valid   = new_in >= 0
-            new_in[valid] = new_in[valid] - rebase
+            # Split flat CSR input_global and rebase non-sentinel indices
+            new_flat, new_offsets = _split_flat_csr(mask, batch.input_global_flat, batch.input_global_offsets)
+            if rebase != 0:
+                valid = new_flat >= 0
+                new_flat[valid] = new_flat[valid] - rebase
             return AssertionLevelBatch(
                 level=batch.level,
                 max_level=batch.max_level,
@@ -2737,10 +2752,8 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
                 assertion_labels=[batch.assertion_labels[i] for i in idx],
                 theorem_labels=[batch.theorem_labels[i] for i in idx],
                 assertion_idx=batch.assertion_idx[mask],
-                input_global_indices=new_in.astype(np.int32),
-                input_counts=batch.input_counts[mask],
-                fhyp_input_positions=batch.fhyp_input_positions[mask],
-                ehyp_input_positions=batch.ehyp_input_positions[mask],
+                input_global_flat=new_flat.astype(np.int32),
+                input_global_offsets=new_offsets.astype(np.int32),
                 output_global_indices=new_out.astype(np.int32),
                 sublevel_ranges=None,  # recomputed at runtime
             )
@@ -2781,7 +2794,8 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
         num_proofs=split,
         assertion_table=plan.assertion_table,  # shared, read-only
         push_global_indices=push_gi_a,
-        push_expressions=push_ex_a,
+        push_expressions_flat=push_flat_a,
+        push_expressions_offsets=push_off_a,
         push_expr_lengths=push_el_a,
         assertion_batches=batches_a,
         final_node_indices=final_a_rebased,
@@ -2800,7 +2814,8 @@ def _split_plan(plan: GlobalPlan, split: int) -> tuple["GlobalPlan", "GlobalPlan
         num_proofs=N - split,
         assertion_table=plan.assertion_table,  # shared, read-only
         push_global_indices=push_gi_b,
-        push_expressions=push_ex_b,
+        push_expressions_flat=push_flat_b,
+        push_expressions_offsets=push_off_b,
         push_expr_lengths=push_el_b,
         assertion_batches=batches_b,
         final_node_indices=final_b_rebased,

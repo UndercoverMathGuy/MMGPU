@@ -177,11 +177,11 @@ __device__ int stream_substitute_and_write(
 // computes polynomial hash.
 
 __global__ void push_nodes_kernel(
-    // Push data
-    const int* __restrict__ push_global_indices,  // [num_push]
-    const tok_t* __restrict__ push_expressions,     // [num_push, push_width]
-    const int* __restrict__ push_expr_lengths,    // [num_push]
-    int push_width,
+    // Push data (flat CSR — no padded 2D array)
+    const int* __restrict__ push_global_indices,    // [num_push]
+    const tok_t* __restrict__ push_expressions_flat, // [total_push_tokens] flat packed
+    const int* __restrict__ push_expr_offsets,       // [num_push+1] CSR offsets
+    const int* __restrict__ push_expr_lengths,       // [num_push]
     int num_push,
     // Output buffers (packed 1D)
     tok_t* __restrict__ expr_buffer,                // [total_expr_tokens] packed
@@ -194,7 +194,7 @@ __global__ void push_nodes_kernel(
 
     int gi = push_global_indices[tid];
     int len = push_expr_lengths[tid];
-    const tok_t* src = push_expressions + (long long)tid * push_width;
+    const tok_t* src = push_expressions_flat + push_expr_offsets[tid];
     tok_t* dst = expr_buffer + expr_offsets[gi];
     int capacity = (int)(expr_offsets[gi + 1] - expr_offsets[gi]);
 
@@ -230,15 +230,10 @@ __global__ void execute_assertion_kernel(
     int B,                                          // number of nodes in this launch
     int batch_offset,                               // offset into batch arrays
     // Per-node batch arrays (on device, contiguous)
-    const int* __restrict__ assertion_idx,          // [total_batch, ] int32
-    const int* __restrict__ input_global_indices,   // [total_batch, max_inputs] int32
-    const int* __restrict__ input_counts,           // [total_batch, ] int32
-    const int* __restrict__ fhyp_input_positions,   // [total_batch, max_fhyps_batch] int32
-    const int* __restrict__ ehyp_input_positions,   // [total_batch, max_ehyps_batch] int32
-    const int* __restrict__ output_global_indices,  // [total_batch, ] int32
-    int max_inputs,
-    int max_fhyps_batch,                            // width of fhyp_input_positions
-    int max_ehyps_batch,                            // width of ehyp_input_positions
+    const int* __restrict__ assertion_idx,          // [total_batch] int32
+    const int* __restrict__ input_global_flat,      // [total_inputs] int32 — flat CSR data
+    const int* __restrict__ input_global_offsets,   // [total_batch+1] int32 — CSR offsets
+    const int* __restrict__ output_global_indices,  // [total_batch] int32
     // Assertion table (on device, shared across all levels)
     const tok_t* __restrict__ tbl_pattern_toks,       // [A, P_max]
     const int* __restrict__ tbl_pattern_lengths,    // [A]
@@ -264,16 +259,17 @@ __global__ void execute_assertion_kernel(
     int b = batch_offset + tid;  // index into batch arrays
 
     int a_idx = assertion_idx[b];
-    int n_inputs = input_counts[b];
     int out_gi = output_global_indices[b];
 
+    // Input CSR slice for this node
+    int inp_start = input_global_offsets[b];
+    int inp_end   = input_global_offsets[b + 1];
+    int n_inputs  = inp_end - inp_start;
+
     // ── (a) Propagate worst input failure code ────────────────────────
-    // Carry the root cause code (max severity) from all inputs instead of
-    // collapsing to FAIL_INPUT. This preserves FAIL_EHYP/FAIL_OVERFLOW across
-    // nodes that have no ehyps of their own (e.g. ax-maj wrapping a failed ax-mp).
     int8_t input_fail_code = FAIL_NONE;
     for (int k = 0; k < n_inputs; k++) {
-        int in_gi = input_global_indices[(long long)b * max_inputs + k];
+        int in_gi = input_global_flat[inp_start + k];
         if (in_gi >= 0) {
             int8_t c = node_fail_code[in_gi];
             if (c > input_fail_code) input_fail_code = c;
@@ -281,20 +277,13 @@ __global__ void execute_assertion_kernel(
     }
 
     // ── (b) Gather $f hyp input global indices ──────────────────────
-    // For each floating hyp, find which input slot it maps to, then
-    // look up the global index of that input.
+    // fhyp positions are always [0, 1, ..., nf-1] in input order.
     int n_fhyps = tbl_fhyp_count[a_idx];
-    // Stack-allocate space for fhyp global indices (max ~20 in practice)
-    // Using a fixed-size array since CUDA doesn't do dynamic stack alloc.
-    int fhyp_gi[64];  // 64 is way more than any real assertion needs
+    int fhyp_gi[64];
     int actual_fhyps = n_fhyps < 64 ? n_fhyps : 64;
 
     for (int f = 0; f < actual_fhyps; f++) {
-        int pos = fhyp_input_positions[(long long)b * max_fhyps_batch + f];
-        // Clamp position to valid range
-        if (pos < 0) pos = 0;
-        if (pos >= max_inputs) pos = max_inputs - 1;
-        int in_gi = input_global_indices[(long long)b * max_inputs + pos];
+        int in_gi = (f < n_inputs) ? input_global_flat[inp_start + f] : 0;
         fhyp_gi[f] = (in_gi >= 0) ? in_gi : 0;
     }
 
@@ -312,14 +301,9 @@ __global__ void execute_assertion_kernel(
         int ehyp_pat_len = tbl_ehyp_pattern_lengths[
             (long long)a_idx * tbl_max_ehyps + e];
 
-        // Get target: the input expression at the ehyp's input position
-        int ehyp_pos = 0;
-        if (e < max_ehyps_batch) {
-            ehyp_pos = ehyp_input_positions[(long long)b * max_ehyps_batch + e];
-        }
-        if (ehyp_pos < 0) ehyp_pos = 0;
-        if (ehyp_pos >= max_inputs) ehyp_pos = max_inputs - 1;
-        int target_gi = input_global_indices[(long long)b * max_inputs + ehyp_pos];
+        // Get target: ehyp e is at input position nf + e
+        int ehyp_pos = n_fhyps + e;
+        int target_gi = (ehyp_pos < n_inputs) ? input_global_flat[inp_start + ehyp_pos] : 0;
         if (target_gi < 0) target_gi = 0;
 
         int target_len = expr_lengths_buf[target_gi];
@@ -434,9 +418,10 @@ __global__ void final_check_kernel(
 
 void push_nodes_launch(
     torch::Tensor push_global_indices,
-    torch::Tensor push_expressions,
+    torch::Tensor push_expressions_flat,
+    torch::Tensor push_expr_offsets,
     torch::Tensor push_expr_lengths,
-    int push_width, int num_push,
+    int num_push,
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
@@ -447,9 +432,10 @@ void push_nodes_launch(
     int blocks = (num_push + threads - 1) / threads;
     push_nodes_kernel<<<blocks, threads>>>(
         push_global_indices.data_ptr<int>(),
-        reinterpret_cast<const tok_t*>(push_expressions.data_ptr<int16_t>()),
+        reinterpret_cast<const tok_t*>(push_expressions_flat.data_ptr<int16_t>()),
+        push_expr_offsets.data_ptr<int>(),
         push_expr_lengths.data_ptr<int>(),
-        push_width, num_push,
+        num_push,
         reinterpret_cast<tok_t*>(expr_buffer.data_ptr<int16_t>()),
         expr_lengths_buf.data_ptr<int>(),
         reinterpret_cast<long long*>(expr_hashes.data_ptr<int64_t>()),
@@ -460,12 +446,9 @@ void push_nodes_launch(
 void execute_assertion_launch(
     int B, int batch_offset,
     torch::Tensor assertion_idx,
-    torch::Tensor input_global_indices,
-    torch::Tensor input_counts,
-    torch::Tensor fhyp_input_positions,
-    torch::Tensor ehyp_input_positions,
+    torch::Tensor input_global_flat,
+    torch::Tensor input_global_offsets,
     torch::Tensor output_global_indices,
-    int max_inputs, int max_fhyps_batch, int max_ehyps_batch,
     torch::Tensor tbl_pattern_toks,
     torch::Tensor tbl_pattern_lengths,
     torch::Tensor tbl_fhyp_var_ids,
@@ -486,12 +469,9 @@ void execute_assertion_launch(
     execute_assertion_kernel<<<blocks, threads>>>(
         B, batch_offset,
         assertion_idx.data_ptr<int>(),
-        input_global_indices.data_ptr<int>(),
-        input_counts.data_ptr<int>(),
-        fhyp_input_positions.data_ptr<int>(),
-        ehyp_input_positions.data_ptr<int>(),
+        input_global_flat.data_ptr<int>(),
+        input_global_offsets.data_ptr<int>(),
         output_global_indices.data_ptr<int>(),
-        max_inputs, max_fhyps_batch, max_ehyps_batch,
         reinterpret_cast<const tok_t*>(tbl_pattern_toks.data_ptr<int16_t>()),
         tbl_pattern_lengths.data_ptr<int>(),
         reinterpret_cast<const tok_t*>(tbl_fhyp_var_ids.data_ptr<int16_t>()),
@@ -626,9 +606,10 @@ void compute_assertion_table_stats_launch(
 
 void push_nodes_launch(
     torch::Tensor push_global_indices,
-    torch::Tensor push_expressions,
+    torch::Tensor push_expressions_flat,
+    torch::Tensor push_expr_offsets,
     torch::Tensor push_expr_lengths,
-    int push_width, int num_push,
+    int num_push,
     torch::Tensor expr_buffer,
     torch::Tensor expr_lengths_buf,
     torch::Tensor expr_hashes,
@@ -638,12 +619,9 @@ void push_nodes_launch(
 void execute_assertion_launch(
     int B, int batch_offset,
     torch::Tensor assertion_idx,
-    torch::Tensor input_global_indices,
-    torch::Tensor input_counts,
-    torch::Tensor fhyp_input_positions,
-    torch::Tensor ehyp_input_positions,
+    torch::Tensor input_global_flat,
+    torch::Tensor input_global_offsets,
     torch::Tensor output_global_indices,
-    int max_inputs, int max_fhyps_batch, int max_ehyps_batch,
     torch::Tensor tbl_pattern_toks,
     torch::Tensor tbl_pattern_lengths,
     torch::Tensor tbl_fhyp_var_ids,
@@ -696,7 +674,7 @@ def _try_compile():
     try:
         from torch.utils.cpp_extension import load_inline
         _compiled_module = load_inline(
-            name="mmgpu_cuda_kernels_v7",
+            name="mmgpu_cuda_kernels_v8",
             cpp_sources=[_CPP_SOURCE],
             cuda_sources=[_CUDA_SOURCE],
             functions=[
@@ -764,16 +742,17 @@ def cuda_compute_assertion_table_stats(
 
 
 def cuda_push_nodes(
-    push_global_indices: np.ndarray,   # [num_push] int32
-    push_expressions: np.ndarray,      # [num_push, push_width] int16
-    push_expr_lengths: np.ndarray,     # [num_push] int32
-    expr_buffer: torch.Tensor,         # [total_expr_tokens] int16 on device (packed 1D)
-    expr_lengths: torch.Tensor,        # [total_nodes] int32 on device
-    expr_hashes: torch.Tensor,         # [total_nodes] int64 on device
-    expr_offsets: torch.Tensor,        # [total_nodes+1] int64 on device
+    push_global_indices: np.ndarray,     # [num_push] int32
+    push_expressions_flat: np.ndarray,   # [total_push_tokens] int16 — flat CSR data
+    push_expressions_offsets: np.ndarray, # [num_push+1] int32 — CSR offsets
+    push_expr_lengths: np.ndarray,       # [num_push] int32
+    expr_buffer: torch.Tensor,           # [total_expr_tokens] int16 on device (packed 1D)
+    expr_lengths: torch.Tensor,          # [total_nodes] int32 on device
+    expr_hashes: torch.Tensor,           # [total_nodes] int64 on device
+    expr_offsets: torch.Tensor,          # [total_nodes+1] int64 on device
     device: torch.device,
 ) -> None:
-    """Launch push_nodes_kernel in chunks to avoid OOM on wide push arrays."""
+    """Launch push_nodes_kernel in chunks to avoid OOM."""
     mod = get_module()
     assert mod is not None
 
@@ -781,38 +760,40 @@ def cuda_push_nodes(
     if num_push == 0:
         return
 
-    push_width = push_expressions.shape[1]
-
     # Chunk size: keep GPU upload < ~512 MB per chunk
-    # Each row = push_width * 2 bytes (int16)
-    bytes_per_row = push_width * 2
-    chunk_rows = max(1, (512 * 1024 * 1024) // bytes_per_row)
+    # Estimate: avg ~10 tokens/push × 2 bytes = ~20 bytes/push
+    chunk_rows = max(1, (512 * 1024 * 1024) // max(20, 1))
 
     for start in range(0, num_push, chunk_rows):
         end = min(start + chunk_rows, num_push)
         n = end - start
 
+        # Slice the flat CSR for this chunk
+        tok_start = int(push_expressions_offsets[start])
+        tok_end = int(push_expressions_offsets[end])
+
         gi_t = torch.from_numpy(np.ascontiguousarray(push_global_indices[start:end])).to(device)
-        ex_t = torch.from_numpy(np.ascontiguousarray(push_expressions[start:end])).to(device)
+        # Re-base offsets to start at 0 for this chunk
+        chunk_offsets = push_expressions_offsets[start:end + 1] - tok_start
+        off_t = torch.from_numpy(np.ascontiguousarray(chunk_offsets.astype(np.int32))).to(device)
+        flat_t = torch.from_numpy(np.ascontiguousarray(push_expressions_flat[tok_start:tok_end])).to(device)
         el_t = torch.from_numpy(np.ascontiguousarray(push_expr_lengths[start:end])).to(device)
 
         mod.push_nodes_launch(
-            gi_t, ex_t, el_t,
-            push_width, n,
+            gi_t, flat_t, off_t, el_t,
+            n,
             expr_buffer, expr_lengths, expr_hashes,
             expr_offsets,
         )
 
-        del gi_t, ex_t, el_t
+        del gi_t, flat_t, off_t, el_t
 
 
 def cuda_execute_level(
-    batch_assertion_idx: np.ndarray,         # [B] int32
-    batch_input_global_indices: np.ndarray,  # [B, max_inputs] int32
-    batch_input_counts: np.ndarray,          # [B] int32
-    batch_fhyp_input_positions: np.ndarray,  # [B, max_fhyps_batch] int32
-    batch_ehyp_input_positions: np.ndarray,  # [B, max_ehyps_batch] int32
-    batch_output_global_indices: np.ndarray, # [B] int32
+    batch_assertion_idx: np.ndarray,          # [B] int32
+    batch_input_global_flat: np.ndarray,      # [total_inputs] int32 — flat CSR data
+    batch_input_global_offsets: np.ndarray,   # [B+1] int32 — CSR offsets
+    batch_output_global_indices: np.ndarray,  # [B] int32
     sublevel_ranges: list[tuple[int, int]],
     # Assertion table (already on device)
     tbl_pattern_toks: torch.Tensor,
@@ -838,36 +819,15 @@ def cuda_execute_level(
     if B_total == 0:
         return
 
-    max_inputs = batch_input_global_indices.shape[1]
-    max_fhyps_batch = batch_fhyp_input_positions.shape[1]
-    max_ehyps_batch = batch_ehyp_input_positions.shape[1]
-
     P_max = tbl_pattern_toks.shape[1]
     tbl_max_fhyps = tbl_fhyp_var_ids.shape[1]
     tbl_max_ehyps = tbl_ehyp_patterns.shape[1]
     E_max = tbl_ehyp_patterns.shape[2]
 
-    # Pad batch fhyp/ehyp position arrays to match table widths if needed
-    if max_fhyps_batch < tbl_max_fhyps:
-        batch_fhyp_input_positions = np.pad(
-            batch_fhyp_input_positions,
-            ((0, 0), (0, tbl_max_fhyps - max_fhyps_batch)),
-        )
-        max_fhyps_batch = tbl_max_fhyps
-    if max_ehyps_batch < tbl_max_ehyps:
-        batch_ehyp_input_positions = np.pad(
-            batch_ehyp_input_positions,
-            ((0, 0), (0, tbl_max_ehyps - max_ehyps_batch)),
-        )
-        max_ehyps_batch = tbl_max_ehyps
-
-    # Upload batch arrays ONCE (small: B × max_inputs ints, etc.)
-    # np.ascontiguousarray ensures torch.from_numpy won't fail on sliced arrays
+    # Upload batch arrays ONCE
     asrt_t = torch.from_numpy(np.ascontiguousarray(batch_assertion_idx)).to(device)
-    in_gi_t = torch.from_numpy(np.ascontiguousarray(batch_input_global_indices)).to(device)
-    in_cnt_t = torch.from_numpy(np.ascontiguousarray(batch_input_counts)).to(device)
-    fhyp_pos_t = torch.from_numpy(np.ascontiguousarray(batch_fhyp_input_positions)).to(device)
-    ehyp_pos_t = torch.from_numpy(np.ascontiguousarray(batch_ehyp_input_positions)).to(device)
+    in_flat_t = torch.from_numpy(np.ascontiguousarray(batch_input_global_flat)).to(device)
+    in_off_t = torch.from_numpy(np.ascontiguousarray(batch_input_global_offsets)).to(device)
     out_gi_t = torch.from_numpy(np.ascontiguousarray(batch_output_global_indices)).to(device)
 
     # Launch one kernel per sublevel range (topological correctness)
@@ -878,9 +838,7 @@ def cuda_execute_level(
 
         mod.execute_assertion_launch(
             sl_size, sl_start,
-            asrt_t, in_gi_t, in_cnt_t,
-            fhyp_pos_t, ehyp_pos_t, out_gi_t,
-            max_inputs, max_fhyps_batch, max_ehyps_batch,
+            asrt_t, in_flat_t, in_off_t, out_gi_t,
             tbl_pattern_toks, tbl_pattern_lengths,
             tbl_fhyp_var_ids, tbl_fhyp_count,
             tbl_ehyp_patterns, tbl_ehyp_pattern_lengths, tbl_ehyp_count,
